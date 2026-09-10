@@ -14,9 +14,11 @@ namespace AssessmentBL
             services.AddDbContext<AssessmentDbContext>(options =>
                 options.UseSqlServer(configuration.GetConnectionString("DefaultConnection")));
 
-            // مستقبلاً هنسجل هنا  الـ Services الخاصة بالـ Assessment
             services.AddScoped<IQuizAttemptService, QuizAttemptService>();
             services.AddScoped<IUserTopicStatService, UserTopicStatService>();
+            services.AddScoped<IQuizService, QuizService>();
+            services.AddScoped<IQuestionServiceForAdmin, QuestionService>();
+            services.AddScoped<IQuestionOptionServiceForAdmin, QuestionOptionService>();
 
             return services;
         }

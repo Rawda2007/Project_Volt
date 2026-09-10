@@ -6,6 +6,7 @@ using AssessmentDA.Entities;
 using Microsoft.EntityFrameworkCore;
 using System.Linq.Expressions;
 using AssessmentBL.Services.Constants;
+using Shared.Common.Exceptions;
 
 namespace AssessmentBL.Services
 {
@@ -99,7 +100,7 @@ namespace AssessmentBL.Services
             };
 
             _db.Questions.Add(question);
-            await _db.SaveChangesAsync(cancellationToken: cancellationToken);
+            await SaveWithDisplayOrderConflictAsync(request.QuizId, request.DisplayOrder, cancellationToken);
 
             return await GetByQuestionIdAsync(question.Id, cancellationToken: cancellationToken);
         }
@@ -133,7 +134,7 @@ namespace AssessmentBL.Services
             question.Points = points;
             question.IsActive = request.IsActive;
 
-            await _db.SaveChangesAsync(cancellationToken: cancellationToken);
+            await SaveWithDisplayOrderConflictAsync(question.QuizId, request.DisplayOrder, cancellationToken);
 
             return await GetByQuestionIdAsync(questionId, cancellationToken: cancellationToken);
         }
@@ -153,6 +154,23 @@ namespace AssessmentBL.Services
 
             await _db.SaveChangesAsync(cancellationToken: cancellationToken);
         }
+        // EnsureDisplayOrderIsFreeAsync is only a friendly pre-check; two admins
+        // can pass it concurrently. UQ_Questions_QuizId_DisplayOrder is the real
+        // protection, and this turns losing that race into a 409 rather than a 500.
+        private async Task SaveWithDisplayOrderConflictAsync(
+            int quizId, short displayOrder, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await _db.SaveChangesAsync(cancellationToken: cancellationToken);
+            }
+            catch (DbUpdateException ex) when (ex.IsUniqueViolationOf("UQ_Questions_QuizId_DisplayOrder"))
+            {
+                throw new ConflictException(
+                    $"الترتيب {displayOrder} مستخدم بالفعل في الاختبار رقم {quizId}", ex);
+            }
+        }
+
         // Mirrors UQ_Questions_QuizId_DisplayOrder so the admin gets a clear
         // conflict instead of a raw unique-index violation.
         private async Task EnsureDisplayOrderIsFreeAsync(int quizId, short displayOrder, int? excludingQuestionId, CancellationToken cancellationToken = default)

@@ -8,12 +8,16 @@ public class QuizAttemptQuestionConfiguration : IEntityTypeConfiguration<QuizAtt
 {
     public void Configure(EntityTypeBuilder<QuizAttemptQuestion> entity)
     {
-        entity.ToTable("QuizAttemptQuestions", "Assessment");
+        entity.ToTable("QuizAttemptQuestions", "Assessment", tb =>
+            tb.HasCheckConstraint("CK_QuizAttemptQuestions_Difficulty",
+                "[Difficulty] IN ('Easy', 'Medium', 'Hard', 'Advanced')"));
 
         entity.HasIndex(e => new { e.QuizAttemptId, e.QuestionId }, "UQ_QuizAttemptQuestions_AttemptId_QuestionId")
             .IsUnique();
 
         entity.HasIndex(e => e.QuestionId, "IX_QuizAttemptQuestions_QuestionId");
+
+        entity.Property(e => e.Difficulty).HasMaxLength(20);
 
         entity.Property(e => e.CreatedAt)
             .HasPrecision(3)
@@ -32,5 +36,22 @@ public class QuizAttemptQuestionConfiguration : IEntityTypeConfiguration<QuizAtt
             .HasForeignKey(d => d.QuestionId)
             .OnDelete(DeleteBehavior.Restrict)
             .HasConstraintName("FK_QuizAttemptQuestions_Questions");
+
+        // DB: no ON DELETE clause (NO ACTION) — the historical topic a past
+        // attempt was classified under cannot be deleted out from under it.
+        entity.HasOne(d => d.Topic).WithMany()
+            .HasForeignKey(d => d.TopicId)
+            .OnDelete(DeleteBehavior.Restrict)
+            .HasConstraintName("FK_QuizAttemptQuestions_Topics");
+
+        // Composite FK against UQ_QuestionOptions_QuestionId_Id, so the
+        // snapshotted answer key is guaranteed to be an option of this very
+        // question — and cannot be deleted while an attempt still grades
+        // against it.
+        entity.HasOne(d => d.CorrectOption).WithMany()
+            .HasPrincipalKey(p => new { p.QuestionId, p.Id })
+            .HasForeignKey(d => new { d.QuestionId, d.CorrectOptionId })
+            .OnDelete(DeleteBehavior.Restrict)
+            .HasConstraintName("FK_QuizAttemptQuestions_QuestionId_CorrectOptionId");
     }
 }

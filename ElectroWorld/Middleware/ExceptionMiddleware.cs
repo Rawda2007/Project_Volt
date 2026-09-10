@@ -1,5 +1,6 @@
 ﻿using System.Net;
 using System.Text.Json;
+using Shared.Common.Exceptions;
 namespace ElectroWorld.Middleware
 {
     public class ExceptionMiddleware
@@ -40,6 +41,7 @@ namespace ElectroWorld.Middleware
             var statusCode = exception switch
             {
                 KeyNotFoundException => (int)HttpStatusCode.NotFound,
+                ConflictException => (int)HttpStatusCode.Conflict,
                 ArgumentException => (int)HttpStatusCode.BadRequest,
                 InvalidOperationException => (int)HttpStatusCode.BadRequest,
                 UnauthorizedAccessException => (int)HttpStatusCode.Forbidden,

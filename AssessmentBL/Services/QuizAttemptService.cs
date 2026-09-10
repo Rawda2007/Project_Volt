@@ -6,6 +6,7 @@ using AssessmentDA.Entities;
 using Microsoft.EntityFrameworkCore;
 using Shared.Assessment.AI;
 using Shared.Common.Abstractions;
+using Shared.Common.Exceptions;
 
 namespace AssessmentBL.Services
 {
@@ -64,7 +65,11 @@ namespace AssessmentBL.Services
                 throw new InvalidOperationException(
                     $"الاختبار رقم {quizId} لا يحتوي على أسئلة مفعّلة");
 
-            return await PersistAttemptAsync(quizId, userId, previousAttemptId: null, questions, cancellationToken);
+            var snapshots = await LoadQuestionSnapshotsAsync(
+                questions.Select(q => q.QuestionId).ToList(), cancellationToken);
+
+            return await PersistAttemptAsync(
+                quizId, userId, previousAttemptId: null, questions, snapshots, cancellationToken);
         }
 
         private async Task<QuizAttemptResponseDto> StartRetryAttemptAsync(
@@ -121,14 +126,55 @@ namespace AssessmentBL.Services
                     question.CurrentHint = hintText;
             }
 
-            return await PersistAttemptAsync(quizId, userId, previousAttemptId, questions, cancellationToken);
+            var snapshots = await LoadQuestionSnapshotsAsync(wrongQuestionIds, cancellationToken);
+
+            return await PersistAttemptAsync(
+                quizId, userId, previousAttemptId, questions, snapshots, cancellationToken);
         }
+
+        /// <summary>
+        /// Reads the question fields that must be frozen for the lifetime of an
+        /// attempt: its classification (TopicId/Difficulty) and its answer key.
+        /// Everything else stays referenced from the live Question row.
+        /// </summary>
+        private async Task<Dictionary<int, QuestionSnapshot>> LoadQuestionSnapshotsAsync(
+            IReadOnlyCollection<int> questionIds,
+            CancellationToken cancellationToken)
+        {
+            var rows = await _db.Questions
+                .AsNoTracking()
+                .Where(q => questionIds.Contains(q.Id))
+                .Select(q => new
+                {
+                    q.Id,
+                    q.TopicId,
+                    q.Difficulty,
+                    CorrectOptionId = q.QuestionOptions
+                        .Where(o => o.IsCorrect)
+                        .Select(o => (int?)o.Id)
+                        .FirstOrDefault()
+                })
+                .ToListAsync(cancellationToken);
+
+            var unanswerable = rows.Where(r => r.CorrectOptionId is null).Select(r => r.Id).ToList();
+
+            if (unanswerable.Count > 0)
+                throw new InvalidOperationException(
+                    $"لا يمكن بدء المحاولة: الأسئلة أرقام {string.Join(", ", unanswerable)} ليس لها إجابة صحيحة");
+
+            return rows.ToDictionary(
+                r => r.Id,
+                r => new QuestionSnapshot(r.TopicId, r.Difficulty, r.CorrectOptionId!.Value));
+        }
+
+        private sealed record QuestionSnapshot(int TopicId, string Difficulty, int CorrectOptionId);
 
         private async Task<QuizAttemptResponseDto> PersistAttemptAsync(
             int quizId,
             Guid userId,
             long? previousAttemptId,
             IReadOnlyList<QuizQuestionForAttemptDto> questions,
+            IReadOnlyDictionary<int, QuestionSnapshot> snapshots,
             CancellationToken cancellationToken)
         {
             var attempt = new QuizAttempt
@@ -146,14 +192,35 @@ namespace AssessmentBL.Services
 
             foreach (var question in questions)
             {
+                var snapshot = snapshots[question.QuestionId];
+
                 attempt.QuizAttemptQuestions.Add(new QuizAttemptQuestion
                 {
-                    QuestionId = question.QuestionId
+                    QuestionId = question.QuestionId,
+                    TopicId = snapshot.TopicId,
+                    Difficulty = snapshot.Difficulty,
+                    CorrectOptionId = snapshot.CorrectOptionId
                 });
             }
 
             _db.QuizAttempts.Add(attempt);
-            await _db.SaveChangesAsync(cancellationToken);
+
+            // The attempt and its snapshot rows go in one SaveChanges, so EF's
+            // implicit transaction already makes them atomic — no explicit
+            // transaction needed here.
+            try
+            {
+                await _db.SaveChangesAsync(cancellationToken);
+            }
+            catch (DbUpdateException ex) when (previousAttemptId is not null
+                                               && ex.IsUniqueViolationOf("UQ_QuizAttempts_PreviousAttemptId"))
+            {
+                // The AnyAsync guard above is only a friendly pre-check; two
+                // concurrent retries can both pass it. UQ_QuizAttempts_PreviousAttemptId
+                // is the real protection and exactly one insert survives it.
+                throw new ConflictException(
+                    $"تمت إعادة المحاولة رقم {previousAttemptId} بالفعل", ex);
+            }
 
             return new QuizAttemptResponseDto
             {
@@ -183,21 +250,24 @@ namespace AssessmentBL.Services
                 throw new InvalidOperationException(
                     $"المحاولة رقم {attemptId} تم تسليمها بالفعل");
 
-            var attemptQuestionIds = await _db.QuizAttemptQuestions
+            // The attempt-start snapshot is the answer key. Grading never reads
+            // QuestionOption.IsCorrect, so an admin editing the correct answer
+            // after this attempt started cannot change how it is scored.
+            var attemptQuestions = await _db.QuizAttemptQuestions
                 .AsNoTracking()
                 .Where(aq => aq.QuizAttemptId == attemptId)
-                .Select(aq => aq.QuestionId)
+                .Select(aq => new { aq.QuestionId, aq.CorrectOptionId })
                 .ToListAsync(cancellationToken);
 
-            var attemptQuestionIdSet = attemptQuestionIds.ToHashSet();
-            var submittedMistakes = ValidateSubmittedMistakes(dto, attemptQuestionIdSet);
+            var correctOptionByQuestion = attemptQuestions.ToDictionary(aq => aq.QuestionId, aq => aq.CorrectOptionId);
+            var submittedMistakes = ValidateSubmittedMistakes(dto, correctOptionByQuestion.Keys.ToHashSet());
 
             var selectedOptionIds = submittedMistakes.Select(m => m.SelectedOptionId).ToList();
 
             var selectedOptions = await _db.QuestionOptions
                 .AsNoTracking()
                 .Where(o => selectedOptionIds.Contains(o.Id))
-                .Select(o => new { o.Id, o.QuestionId, o.IsCorrect })
+                .Select(o => new { o.Id, o.QuestionId })
                 .ToListAsync(cancellationToken);
 
             var optionsById = selectedOptions.ToDictionary(o => o.Id);
@@ -214,7 +284,7 @@ namespace AssessmentBL.Services
                         $"الاختيار رقم {mistake.SelectedOptionId} لا يخص السؤال رقم {mistake.QuestionId}",
                         nameof(dto));
 
-                if (!option.IsCorrect)
+                if (mistake.SelectedOptionId != correctOptionByQuestion[mistake.QuestionId])
                     confirmedMistakes.Add(mistake);
             }
 
@@ -246,7 +316,25 @@ namespace AssessmentBL.Services
             attempt.Status = QuizAttemptStatuses.Completed;
             attempt.CompletedAt = _clock.UtcNow;
 
-            await _db.SaveChangesAsync(cancellationToken);
+            // QuizAttempts.RowVersion is a concurrency token, so EF appends it
+            // to this UPDATE's WHERE clause. Of two concurrent submits exactly
+            // one matches; the loser affects 0 rows, throws, and its whole
+            // transaction — mistakes, hints and stats included — rolls back.
+            try
+            {
+                await _db.SaveChangesAsync(cancellationToken);
+            }
+            catch (DbUpdateConcurrencyException ex)
+            {
+                throw new ConflictException(
+                    $"المحاولة رقم {attemptId} تم تسليمها بالفعل", ex);
+            }
+            catch (DbUpdateException ex) when (
+                ex.IsUniqueViolationOf("UQ_QuizAttemptMistakes_AttemptId_QuestionId"))
+            {
+                throw new ConflictException(
+                    $"المحاولة رقم {attemptId} تم تسليمها بالفعل", ex);
+            }
 
             await PersistHintsAsync(recordedMistakes, hints.HintTextByQuestion, cancellationToken);
 

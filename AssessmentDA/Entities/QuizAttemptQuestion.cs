@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 
 namespace AssessmentDA.Entities;
@@ -11,10 +11,35 @@ public partial class QuizAttemptQuestion
 
     public int QuestionId { get; set; }
 
+    /// <summary>
+    /// Topic the question was classified under when the attempt started.
+    /// Statistics for this attempt are attributed here, not to the
+    /// question's current TopicId.
+    /// </summary>
+    public int TopicId { get; set; }
+
+    /// <summary>
+    /// Difficulty the question carried when the attempt started.
+    /// </summary>
+    public string Difficulty { get; set; } = null!;
+
+    /// <summary>
+    /// The answer key as it stood when the attempt started. Submissions are
+    /// graded against this, never against QuestionOption.IsCorrect, so an
+    /// admin editing the correct answer cannot retroactively change how an
+    /// in-flight or past attempt was scored.
+    /// </summary>
+    public int CorrectOptionId { get; set; }
+
     public DateTime CreatedAt { get; set; }
 
     public virtual QuizAttempt QuizAttempt { get; set; } = null!;
 
     public virtual Question Question { get; set; } = null!;
+
+    public virtual Topic Topic { get; set; } = null!;
+
+    public virtual QuestionOption CorrectOption { get; set; } = null!;
+
     public virtual QuizAttemptMistake? QuizAttemptMistake { get; set; }
 }

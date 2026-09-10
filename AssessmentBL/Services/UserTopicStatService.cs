@@ -96,15 +96,18 @@ namespace AssessmentBL.Services
                 throw new InvalidOperationException(
                     $"المحاولة رقم {quizAttemptId} لم تكتمل بعد");
 
-            // The authoritative set of questions this attempt contained.
+            // The authoritative set of questions this attempt contained, with
+            // the classification frozen at attempt start. Reading TopicId /
+            // Difficulty from the live Question row here would re-attribute
+            // this attempt's counters if an admin later re-classified it.
             var attemptQuestions = await _db.QuizAttemptQuestions
                 .AsNoTracking()
                 .Where(aq => aq.QuizAttemptId == quizAttemptId)
                 .Select(aq => new
                 {
                     aq.QuestionId,
-                    aq.Question.TopicId,
-                    aq.Question.Difficulty
+                    aq.TopicId,
+                    aq.Difficulty
                 })
                 .ToListAsync(cancellationToken);
 
@@ -116,8 +119,8 @@ namespace AssessmentBL.Services
                 .Where(h => h.QuizAttemptMistake.QuizAttempt.UserId == userId)
                 .GroupBy(h => new
                 {
-                    h.QuizAttemptMistake.Question.TopicId,
-                    h.QuizAttemptMistake.Question.Difficulty
+                    h.QuizAttemptMistake.QuizAttemptQuestion.TopicId,
+                    h.QuizAttemptMistake.QuizAttemptQuestion.Difficulty
                 })
                 .Select(g => new { g.Key.TopicId, g.Key.Difficulty, Count = g.Count() })
                 .ToListAsync(cancellationToken);

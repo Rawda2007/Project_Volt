@@ -19,6 +19,7 @@ public class UserTopicStatController : ControllerBase
     }
 
     [HttpGet]
+    [ProducesResponseType(StatusCodes.Status200OK)]
     public async Task<ActionResult<IReadOnlyList<UserTopicStatResponseDto>>> GetMine(CancellationToken ct)
     {
         var userId = User.GetUserId();
@@ -27,6 +28,8 @@ public class UserTopicStatController : ControllerBase
     }
 
     [HttpGet("{topicId:int}/{difficulty}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<ActionResult<UserTopicStatResponseDto>> GetByTopicAndDifficulty(int topicId, string difficulty, CancellationToken ct)
     {
         var userId = User.GetUserId();
@@ -34,15 +37,8 @@ public class UserTopicStatController : ControllerBase
         return stat is null ? NotFound() : Ok(stat);
     }
 
-    // See "Potential Issues Found": this recalculation path is already
-    // triggered internally by QuizAttemptService.SubmitAsync on every
-    // successful submit. Exposed here only because it is a public method
-    // on IUserTopicStatService.
-    [HttpPost("recalculate")]
-    public async Task<IActionResult> UpdateAfterQuizAttempt([FromQuery] long quizAttemptId, CancellationToken ct)
-    {
-        var userId = User.GetUserId();
-        await _userTopicStatService.UpdateAfterQuizAttemptAsync(quizAttemptId, userId, ct);
-        return NoContent();
-    }
+    // No recalculate endpoint by design. UpdateAfterQuizAttemptAsync accumulates
+    // (+=) into the stats row and is not idempotent, so exposing it would let any
+    // user inflate their own counters without bound by re-posting it. It stays an
+    // internal step of SubmitAsync, inside that method's transaction.
 }

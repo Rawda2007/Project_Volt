@@ -4,6 +4,7 @@ using AssessmentDA.Context;
 using AssessmentDA.Entities;
 using Microsoft.EntityFrameworkCore;
 using System.Linq.Expressions;
+using Shared.Common.Exceptions;
 
 namespace AssessmentBL.Services
 {
@@ -60,7 +61,7 @@ namespace AssessmentBL.Services
             };
 
             _db.QuestionOptions.Add(option);
-            await _db.SaveChangesAsync(cancellationToken);
+            await SaveWithOptionConflictAsync(request.QuestionId, request.DisplayOrder, cancellationToken);
 
             return ToResponse(option);
         }
@@ -112,7 +113,7 @@ namespace AssessmentBL.Services
             option.IsCorrect = request.IsCorrect;
             option.DisplayOrder = request.DisplayOrder;
 
-            await _db.SaveChangesAsync(cancellationToken: cancellationToken);
+            await SaveWithOptionConflictAsync(option.QuestionId, request.DisplayOrder, cancellationToken);
 
             return ToResponse(option);
         }
@@ -129,6 +130,16 @@ namespace AssessmentBL.Services
             if (isReferenced)
                 throw new InvalidOperationException(
                     $"لا يمكن حذف الاختيار رقم {optionId} لأنه مستخدم في محاولات سابقة");
+
+            // FK_QuizAttemptQuestions_QuestionId_CorrectOptionId would block this
+            // anyway; checking here turns it into a clear business message.
+            var isSnapshottedAnswerKey = await _db.QuizAttemptQuestions
+                .AsNoTracking()
+                .AnyAsync(aq => aq.CorrectOptionId == optionId, cancellationToken: cancellationToken);
+
+            if (isSnapshottedAnswerKey)
+                throw new InvalidOperationException(
+                    $"لا يمكن حذف الاختيار رقم {optionId} لأنه الإجابة الصحيحة المسجّلة في محاولات سابقة");
 
             var questionIsActive = await _db.Questions
                 .AsNoTracking()
@@ -152,6 +163,31 @@ namespace AssessmentBL.Services
 
             _db.QuestionOptions.Remove(option);
             await _db.SaveChangesAsync(cancellationToken);
+        }
+
+        // The EnsureXxx pre-checks below are friendly validation only; two admins
+        // can pass them concurrently. UQ_QuestionOptions_QuestionId_DisplayOrder
+        // and UQ_QuestionOptions_OneCorrectPerQuestion are the real protection,
+        // and this turns losing either race into a 409 rather than a 500.
+        private async Task SaveWithOptionConflictAsync(
+            int questionId, short displayOrder, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await _db.SaveChangesAsync(cancellationToken: cancellationToken);
+            }
+            catch (DbUpdateException ex) when (
+                ex.IsUniqueViolationOf("UQ_QuestionOptions_QuestionId_DisplayOrder"))
+            {
+                throw new ConflictException(
+                    $"الترتيب {displayOrder} مستخدم بالفعل في السؤال رقم {questionId}", ex);
+            }
+            catch (DbUpdateException ex) when (
+                ex.IsUniqueViolationOf("UQ_QuestionOptions_OneCorrectPerQuestion"))
+            {
+                throw new ConflictException(
+                    $"السؤال رقم {questionId} له إجابة صحيحة بالفعل", ex);
+            }
         }
 
         // Mirrors UQ_QuestionOptions_QuestionId_DisplayOrder.

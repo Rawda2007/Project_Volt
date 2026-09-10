@@ -1,4 +1,4 @@
-using AIIntegration;
+﻿using AIIntegration;
 using AssessmentBL;
 using ContentBL;
 using ElectroWorld.Middleware;
@@ -46,6 +46,8 @@ builder.Services.AddSwaggerGen(options =>
 builder.Services.AddShared(builder.Configuration);
 builder.Services.AddUsersModule(builder.Configuration);
 builder.Services.AddContentModule(builder.Configuration);
+builder.Services.AddAssessmentModule(builder.Configuration);
+builder.Services.AddAiIntegration(builder.Configuration);
 
 var jwtSettings = builder.Configuration.GetSection(JwtSettings.SectionName).Get<JwtSettings>()
     ?? throw new InvalidOperationException("Jwt section is missing from appsettings.json");
@@ -95,5 +97,3 @@ app.UseAuthorization();
 app.MapControllers();
 
 app.Run();
-        builder.Services.AddAssessmentModule(builder.Configuration);
-        builder.Services.AddAiIntegration(builder.Configuration);

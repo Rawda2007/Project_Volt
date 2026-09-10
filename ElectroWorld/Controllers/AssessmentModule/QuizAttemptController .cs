@@ -22,6 +22,11 @@ public class QuizAttemptController : ControllerBase
     // Retry attempt: previousAttemptId is also supplied (service resolves
     // which questions to serve and attaches the latest hints).
     [HttpPost]
+    [ProducesResponseType(StatusCodes.Status201Created)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
     public async Task<ActionResult<QuizAttemptResponseDto>> Start(
         [FromQuery] int quizId,
         [FromQuery] long? previousAttemptId,
@@ -33,6 +38,11 @@ public class QuizAttemptController : ControllerBase
     }
 
     [HttpPost("{attemptId:long}/submit")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status409Conflict)]
     public async Task<ActionResult<QuizAttemptResultDto>> Submit(
         long attemptId,
         [FromBody] SubmitQuizAttemptDto dto,
@@ -44,6 +54,9 @@ public class QuizAttemptController : ControllerBase
     }
 
     [HttpGet("{attemptId:long}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<ActionResult<QuizAttemptResponseDto>> GetById(long attemptId, CancellationToken ct)
     {
         var userId = User.GetUserId();
