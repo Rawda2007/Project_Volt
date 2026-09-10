@@ -220,33 +220,35 @@ namespace AssessmentBL.Services
 
             var totalQuestions = attempt.TotalQuestionsAtAttempt;
             var correctAnswers = (short)(totalQuestions - confirmedMistakes.Count);
-            var completedAt = _clock.UtcNow;
+
+            var hints = await GenerateHintsAsync(userId, confirmedMistakes, cancellationToken);
 
             await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken);
 
+            var recordedMistakes = new List<QuizAttemptMistake>(confirmedMistakes.Count);
+
             foreach (var mistake in confirmedMistakes)
             {
-                _db.QuizAttemptMistakes.Add(new QuizAttemptMistake
+                var recorded = new QuizAttemptMistake
                 {
                     QuizAttemptId = attemptId,
                     QuestionId = mistake.QuestionId,
                     SelectedOptionId = mistake.SelectedOptionId
-                });
+                };
+
+                _db.QuizAttemptMistakes.Add(recorded);
+                recordedMistakes.Add(recorded);
             }
 
             attempt.QuestionsAnsweredCount = totalQuestions;
             attempt.CorrectAnswersCount = correctAnswers;
             attempt.ScorePercentage = CalculateScorePercentage(correctAnswers, totalQuestions);
             attempt.Status = QuizAttemptStatuses.Completed;
-            attempt.CompletedAt = completedAt;
+            attempt.CompletedAt = _clock.UtcNow;
 
             await _db.SaveChangesAsync(cancellationToken);
 
-            var retryQuestions = await GenerateAndPersistHintsAsync(
-                attemptId,
-                userId,
-                confirmedMistakes,
-                cancellationToken);
+            await PersistHintsAsync(recordedMistakes, hints.HintTextByQuestion, cancellationToken);
 
             await _userTopicStatService.UpdateAfterQuizAttemptAsync(attemptId, userId, cancellationToken);
 
@@ -259,18 +261,17 @@ namespace AssessmentBL.Services
                 CorrectAnswers = correctAnswers,
                 WrongAnswers = (short)(totalQuestions - correctAnswers),
                 ScorePercentage = attempt.ScorePercentage,
-                RetryQuestions = retryQuestions
+                RetryQuestions = hints.RetryQuestions
             };
         }
 
-        private async Task<List<QuizQuestionForAttemptDto>> GenerateAndPersistHintsAsync(
-            long attemptId,
+        private async Task<GeneratedHints> GenerateHintsAsync(
             Guid userId,
             IReadOnlyList<QuizAttemptMistakeDto> mistakes,
             CancellationToken cancellationToken)
         {
             if (mistakes.Count == 0)
-                return [];
+                return GeneratedHints.None;
 
             var questionIds = mistakes.Select(m => m.QuestionId).ToList();
             var selectedOptionIds = mistakes.Select(m => m.SelectedOptionId).ToList();
@@ -340,25 +341,7 @@ namespace AssessmentBL.Services
                 || generatedByQuestion.Values.Any(string.IsNullOrWhiteSpace))
                 throw new InvalidOperationException("The AI response did not contain one valid hint per wrong question");
 
-            var currentMistakes = await _db.QuizAttemptMistakes
-                .Where(m => m.QuizAttemptId == attemptId)
-                .ToListAsync(cancellationToken);
-            var nextSequences = await _db.QuestionHints
-                .Where(h => currentMistakes.Select(m => m.Id).Contains(h.QuizAttemptMistakeId))
-                .GroupBy(h => h.QuizAttemptMistakeId)
-                .ToDictionaryAsync(g => g.Key, g => (byte)(g.Max(h => h.HintSequence) + 1), cancellationToken);
-
-            var persistedHints = currentMistakes.Select(m => new QuestionHint
-            {
-                QuizAttemptMistakeId = m.Id,
-                HintText = generatedByQuestion[m.QuestionId],
-                HintSequence = nextSequences.TryGetValue(m.Id, out var sequence) ? sequence : (byte)1
-            }).ToList();
-
-            _db.QuestionHints.AddRange(persistedHints);
-            await _db.SaveChangesAsync(cancellationToken);
-
-            return questions
+            var retryQuestions = questions
                 .OrderBy(q => q.DisplayOrder)
                 .Select(q => new QuizQuestionForAttemptDto
                 {
@@ -371,6 +354,41 @@ namespace AssessmentBL.Services
                     Options = q.Options
                 })
                 .ToList();
+
+            return new GeneratedHints(generatedByQuestion, retryQuestions);
+        }
+
+        private async Task PersistHintsAsync(
+            IReadOnlyList<QuizAttemptMistake> recordedMistakes,
+            IReadOnlyDictionary<int, string> hintTextByQuestion,
+            CancellationToken cancellationToken)
+        {
+            if (recordedMistakes.Count == 0)
+                return;
+
+            var mistakeIds = recordedMistakes.Select(m => m.Id).ToList();
+            var nextSequences = await _db.QuestionHints
+                .Where(h => mistakeIds.Contains(h.QuizAttemptMistakeId))
+                .GroupBy(h => h.QuizAttemptMistakeId)
+                .ToDictionaryAsync(g => g.Key, g => (byte)(g.Max(h => h.HintSequence) + 1), cancellationToken);
+
+            var persistedHints = recordedMistakes.Select(m => new QuestionHint
+            {
+                QuizAttemptMistakeId = m.Id,
+                HintText = hintTextByQuestion[m.QuestionId],
+                HintSequence = nextSequences.TryGetValue(m.Id, out var sequence) ? sequence : (byte)1
+            }).ToList();
+
+            _db.QuestionHints.AddRange(persistedHints);
+            await _db.SaveChangesAsync(cancellationToken);
+        }
+
+        private sealed record GeneratedHints(
+            IReadOnlyDictionary<int, string> HintTextByQuestion,
+            List<QuizQuestionForAttemptDto> RetryQuestions)
+        {
+            public static GeneratedHints None { get; } =
+                new(new Dictionary<int, string>(), []);
         }
 
         public async Task<QuizAttemptResponseDto> GetByIdAsync(
