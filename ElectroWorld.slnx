@@ -15,5 +15,6 @@
   <Folder Name="/Shared/">
     <Project Path="Shared/Shared.csproj" />
   </Folder>
+  <Project Path="AIIntegration/AIIntegration.csproj" />
   <Project Path="ElectroWorld/Volt.csproj" />
 </Solution>

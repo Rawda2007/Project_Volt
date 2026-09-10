@@ -1,12 +1,15 @@
-using System.Text;
+using AIIntegration;
+using AssessmentBL;
+using ContentBL;
+using ElectroWorld.Middleware;
+using ElectroWorld.Swagger;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
-using ElectroWorld.Swagger;
 using Shared;
 using Shared.Users;
+using System.Text;
 using UsersBL;
-using ContentBL;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -83,7 +86,7 @@ var app = builder.Build();
 //}
 
 app.UseHttpsRedirection();
-
+app.UseMiddleware<ExceptionMiddleware>();
 app.UseStaticFiles(); // عشان الصور اللي جوه wwwroot/uploads تبقى قابلة للوصول من رابط مباشر
 
 app.UseAuthentication();
@@ -92,3 +95,5 @@ app.UseAuthorization();
 app.MapControllers();
 
 app.Run();
+        builder.Services.AddAssessmentModule(builder.Configuration);
+        builder.Services.AddAiIntegration(builder.Configuration);

@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
+﻿<Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
@@ -13,12 +13,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Folder Include="Controllers\" />
-  </ItemGroup>
-
-  <ItemGroup>
+    <ProjectReference Include="..\AssessmentBL\AssessmentBL.csproj" />
     <ProjectReference Include="..\UsersBL\UsersBL.csproj" />
     <ProjectReference Include="..\ContentBL\ContentBL.csproj" />
+    <ProjectReference Include="..\AIIntegration\AIIntegration.csproj" />
     <ProjectReference Include="..\Shared\Shared.csproj" />
   </ItemGroup>
 
