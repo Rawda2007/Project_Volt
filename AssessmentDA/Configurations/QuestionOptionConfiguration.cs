@@ -8,7 +8,17 @@ public class QuestionOptionConfiguration : IEntityTypeConfiguration<QuestionOpti
 {
     public void Configure(EntityTypeBuilder<QuestionOption> entity)
     {
-        entity.ToTable("QuestionOptions", "Assessment");
+        entity.ToTable("QuestionOptions", "Assessment", tb =>
+        {
+            tb.HasCheckConstraint("CK_QuestionOptions_TextOrImage",
+                "[OptionText] IS NOT NULL OR [ImageUrl] IS NOT NULL");
+
+            // An option the child can only see as an image must carry a
+            // description, or the AI has nothing to reason about.
+            tb.HasCheckConstraint("CK_QuestionOptions_ImageOptionHasDescription",
+                "([OptionText] IS NOT NULL AND LTRIM(RTRIM([OptionText])) <> '') "
+              + "OR [ImageDescription] IS NOT NULL");
+        });
 
         // Filtered unique index: at most one IsCorrect = 1 row per question.
         // The full rule ("exactly one, never zero") remains a service-layer
@@ -25,6 +35,9 @@ public class QuestionOptionConfiguration : IEntityTypeConfiguration<QuestionOpti
         // is an additional covering unique index required by SQL Server
         // for the composite FK to be valid.
         entity.HasIndex(e => new { e.QuestionId, e.Id }, "UQ_QuestionOptions_QuestionId_Id").IsUnique();
+
+        entity.Property(e => e.ImageUrl).HasMaxLength(500);
+        entity.Property(e => e.ImageDescription).HasMaxLength(1000);
 
         entity.Property(e => e.CreatedAt)
             .HasPrecision(3)

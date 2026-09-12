@@ -26,4 +26,7 @@ public partial class Topic
     public virtual ICollection<Question> Questions { get; set; } = new List<Question>();
 
     public virtual ICollection<UserTopicStat> UserTopicStats { get; set; } = new List<UserTopicStat>();
+
+    public virtual ICollection<TopicTranslation> TopicTranslations { get; set; }
+        = new List<TopicTranslation>();
 }

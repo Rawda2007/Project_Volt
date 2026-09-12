@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 
 namespace AssessmentDA.Entities;
@@ -29,7 +29,15 @@ public partial class QuizAttemptQuestion
     /// admin editing the correct answer cannot retroactively change how an
     /// in-flight or past attempt was scored.
     /// </summary>
-    public int CorrectOptionId { get; set; }
+    /// <summary>Null only for Essay questions, which have no answer key.
+    /// CK_QuizAttemptQuestions_EssayHasNoKey enforces that at the database.</summary>
+    public int? CorrectOptionId { get; set; }
+
+    /// <summary>
+    /// The question's type when the attempt started. Frozen for the same reason
+    /// Difficulty is: it decides how the answer is graded.
+    /// </summary>
+    public string QuestionType { get; set; } = null!;
 
     public DateTime CreatedAt { get; set; }
 
@@ -39,7 +47,7 @@ public partial class QuizAttemptQuestion
 
     public virtual Topic Topic { get; set; } = null!;
 
-    public virtual QuestionOption CorrectOption { get; set; } = null!;
+    public virtual QuestionOption? CorrectOption { get; set; }
 
     public virtual QuizAttemptMistake? QuizAttemptMistake { get; set; }
 }

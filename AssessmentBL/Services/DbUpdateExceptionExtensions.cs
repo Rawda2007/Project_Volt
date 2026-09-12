@@ -12,6 +12,24 @@ internal static class DbUpdateExceptionExtensions
 {
     private const int UniqueIndexViolation = 2601;
     private const int UniqueConstraintViolation = 2627;
+    private const int DeadlockVictim = 1205;
+
+    /// <summary>
+    /// True when SQL Server chose this request as a deadlock victim, whether the
+    /// provider surfaced it directly (a query) or wrapped it in a
+    /// DbUpdateException (SaveChanges). The victim's transaction is already
+    /// rolled back by the server.
+    /// </summary>
+    public static bool IsDeadlockVictim(this Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is SqlException { Number: DeadlockVictim })
+                return true;
+        }
+
+        return false;
+    }
 
     public static bool IsUniqueViolation(this DbUpdateException exception) =>
         exception.InnerException is SqlException sql

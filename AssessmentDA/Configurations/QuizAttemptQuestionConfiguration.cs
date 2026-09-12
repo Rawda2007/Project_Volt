@@ -9,8 +9,18 @@ public class QuizAttemptQuestionConfiguration : IEntityTypeConfiguration<QuizAtt
     public void Configure(EntityTypeBuilder<QuizAttemptQuestion> entity)
     {
         entity.ToTable("QuizAttemptQuestions", "Assessment", tb =>
+        {
             tb.HasCheckConstraint("CK_QuizAttemptQuestions_Difficulty",
-                "[Difficulty] IN ('Easy', 'Medium', 'Hard', 'Advanced')"));
+                "[Difficulty] IN ('Easy', 'Medium', 'Hard', 'Advanced')");
+            tb.HasCheckConstraint("CK_QuizAttemptQuestions_QuestionType",
+                "[QuestionType] IN ('MultipleChoice', 'TrueFalse', 'Essay')");
+            // Mirrors the live constraint: an Essay has NO answer key, and every
+            // other type has one. (CorrectOptionId must be NULLable in the table for
+            // this to admit an Essay at all — see db/migrations/006 §2.)
+            tb.HasCheckConstraint("CK_QuizAttemptQuestions_EssayHasNoKey",
+                "([QuestionType] = 'Essay' AND [CorrectOptionId] IS NULL) "
+              + "OR ([QuestionType] <> 'Essay' AND [CorrectOptionId] IS NOT NULL)");
+        });
 
         entity.HasIndex(e => new { e.QuizAttemptId, e.QuestionId }, "UQ_QuizAttemptQuestions_AttemptId_QuestionId")
             .IsUnique();
@@ -18,6 +28,9 @@ public class QuizAttemptQuestionConfiguration : IEntityTypeConfiguration<QuizAtt
         entity.HasIndex(e => e.QuestionId, "IX_QuizAttemptQuestions_QuestionId");
 
         entity.Property(e => e.Difficulty).HasMaxLength(20);
+        entity.Property(e => e.QuestionType)
+            .HasMaxLength(20)
+            .HasDefaultValue("MultipleChoice");
 
         entity.Property(e => e.CreatedAt)
             .HasPrecision(3)

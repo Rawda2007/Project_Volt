@@ -31,6 +31,12 @@ public class QuizAttemptConfiguration : IEntityTypeConfiguration<QuizAttempt>
         entity.HasIndex(e => e.QuizId, "IX_QuizAttempts_QuizId");
         entity.HasIndex(e => new { e.UserId, e.QuizId, e.StartedAt }, "IX_QuizAttempts_UserId_QuizId_StartedAt");
 
+        // Serves the abandoned-attempt sweep (Status = 'InProgress' AND
+        // StartedAt <= cutoff). Filtered, so it only ever holds live attempts and
+        // stays tiny. Created by db/migrations/006.
+        entity.HasIndex(e => e.StartedAt, "IX_QuizAttempts_InProgress_StartedAt")
+            .HasFilter("([Status]=N'InProgress')");
+
         entity.Property(e => e.ScorePercentage).HasColumnType("decimal(5, 2)");
         entity.Property(e => e.Status)
             .HasMaxLength(20)
@@ -57,7 +63,12 @@ public class QuizAttemptConfiguration : IEntityTypeConfiguration<QuizAttempt>
         // claim). No physical FK by design.
         // Configurations/QuizAttemptConfiguration.cs — additions inside Configure(...)
 
-        entity.HasIndex(e => e.PreviousAttemptId, "UQ_QuizAttempts_PreviousAttemptId").IsUnique();
+        // FILTERED: a plain UNIQUE key would allow only ONE row with a NULL
+        // PreviousAttemptId — that is, one first attempt in the whole database.
+        // The rule is only "an attempt may be retried once". See db/migrations/010.
+        entity.HasIndex(e => e.PreviousAttemptId, "UQ_QuizAttempts_PreviousAttemptId")
+            .IsUnique()
+            .HasFilter("([PreviousAttemptId] IS NOT NULL)");
 
         entity.HasOne(d => d.PreviousAttempt)
             .WithOne(d => d.NextAttempt)

@@ -48,15 +48,21 @@ public class AssessmentModelTests
     }
 
     [Fact]
-    public void QuizAttemptQuestion_SnapshotColumns_AreRequired()
+    public void QuizAttemptQuestion_ClassificationSnapshotIsAlwaysRequired()
     {
         using var db = CreateContext();
 
         var entity = db.Model.FindEntityType(typeof(QuizAttemptQuestion))!;
 
+        // Topic and difficulty are frozen for every question type.
         Assert.False(entity.FindProperty(nameof(QuizAttemptQuestion.TopicId))!.IsNullable);
         Assert.False(entity.FindProperty(nameof(QuizAttemptQuestion.Difficulty))!.IsNullable);
-        Assert.False(entity.FindProperty(nameof(QuizAttemptQuestion.CorrectOptionId))!.IsNullable);
+
+        // CorrectOptionId became nullable when Essay support landed — an Essay has
+        // no answer key. The database still forbids a NULL key on any other type
+        // via CK_QuizAttemptQuestions_EssayHasNoKey, which nullability alone
+        // cannot express. See QuestionTypeAndLocalizationModelTests.
+        Assert.True(entity.FindProperty(nameof(QuizAttemptQuestion.CorrectOptionId))!.IsNullable);
     }
 
     [Fact]
@@ -78,5 +84,107 @@ public class AssessmentModelTests
             new[] { nameof(QuestionOption.QuestionId), nameof(QuestionOption.Id) },
             foreignKey.PrincipalKey.Properties.Select(p => p.Name).ToArray());
         Assert.Equal(DeleteBehavior.Restrict, foreignKey.DeleteBehavior);
+    }
+}
+
+/// <summary>
+/// Guards the question-type, media and localization additions: the EF model must
+/// still build, and the mappings the new grading and fallback logic depends on
+/// must match what the SQL migration declares.
+/// </summary>
+public class QuestionTypeAndLocalizationModelTests
+{
+    private static AssessmentDbContext CreateContext()
+    {
+        var options = new DbContextOptionsBuilder<AssessmentDbContext>()
+            .UseSqlServer("Server=none;Database=VoltDB;Trusted_Connection=True;")
+            .Options;
+
+        return new AssessmentDbContext(options);
+    }
+
+    [Fact]
+    public void Model_StillBuildsWithTranslationsAndEssayAnswers()
+    {
+        using var db = CreateContext();
+        Assert.NotNull(db.Model);
+    }
+
+    [Fact]
+    public void QuizAttemptQuestion_CorrectOptionId_IsNullableForEssay()
+    {
+        using var db = CreateContext();
+
+        var property = db.Model
+            .FindEntityType(typeof(QuizAttemptQuestion))!
+            .FindProperty(nameof(QuizAttemptQuestion.CorrectOptionId))!;
+
+        // An Essay has no answer key. CK_QuizAttemptQuestions_EssayHasNoKey is what
+        // stops a non-Essay question from exploiting the nullability.
+        Assert.True(property.IsNullable);
+    }
+
+    [Fact]
+    public void QuizAttemptQuestion_SnapshotsQuestionType()
+    {
+        using var db = CreateContext();
+
+        var property = db.Model
+            .FindEntityType(typeof(QuizAttemptQuestion))!
+            .FindProperty(nameof(QuizAttemptQuestion.QuestionType))!;
+
+        // Type decides how the answer is graded, so it is frozen like Difficulty.
+        Assert.False(property.IsNullable);
+    }
+
+    [Fact]
+    public void QuestionOption_TextIsNullable_ImageIsNullable()
+    {
+        using var db = CreateContext();
+        var entity = db.Model.FindEntityType(typeof(QuestionOption))!;
+
+        Assert.True(entity.FindProperty(nameof(QuestionOption.OptionText))!.IsNullable);
+        Assert.True(entity.FindProperty(nameof(QuestionOption.ImageUrl))!.IsNullable);
+    }
+
+    [Fact]
+    public void QuestionHint_SequenceUniquenessIsPerLanguage()
+    {
+        using var db = CreateContext();
+
+        var index = db.Model
+            .FindEntityType(typeof(QuestionHint))!
+            .GetIndexes()
+            .Single(i => i.IsUnique);
+
+        // Without LanguageCode in the key, an Arabic and an English hint could not
+        // both be sequence 1 for the same mistake.
+        Assert.Equal(
+            new[]
+            {
+                nameof(QuestionHint.QuizAttemptMistakeId),
+                nameof(QuestionHint.LanguageCode),
+                nameof(QuestionHint.HintSequence)
+            },
+            index.Properties.Select(p => p.Name).ToArray());
+    }
+
+    [Theory]
+    [InlineData("QuestionTranslations")]
+    [InlineData("QuestionOptionTranslations")]
+    [InlineData("QuizTranslations")]
+    [InlineData("TopicTranslations")]
+    [InlineData("CategoryTranslations")]
+    public void EveryTranslationTable_IsUniquePerParentAndLanguage(string tableName)
+    {
+        using var db = CreateContext();
+
+        var entity = db.Model.GetEntityTypes()
+            .Single(e => e.GetTableName() == tableName);
+
+        var unique = entity.GetIndexes().Single(i => i.IsUnique);
+
+        Assert.Contains("LanguageCode", unique.Properties.Select(p => p.Name));
+        Assert.Equal(2, unique.Properties.Count);
     }
 }
