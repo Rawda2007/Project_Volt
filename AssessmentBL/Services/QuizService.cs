@@ -6,6 +6,8 @@ using AssessmentDA.Context;
 using AssessmentDA.Entities;
 using Microsoft.EntityFrameworkCore;
 using Shared.Common.Abstractions;
+using Shared.Common.Exceptions;
+using Shared.Content;
 using System.Linq.Expressions;
 
 namespace AssessmentBL.Services
@@ -32,11 +34,19 @@ namespace AssessmentBL.Services
 
         private readonly AssessmentDbContext _db;
         private readonly IDateTimeProvider _clock;
+        private readonly ILessonAvailability _lessons;
+        private readonly ILevelCatalog _levels;
 
-        public QuizService(AssessmentDbContext db, IDateTimeProvider clock)
+        public QuizService(
+            AssessmentDbContext db,
+            IDateTimeProvider clock,
+            ILessonAvailability lessons,
+            ILevelCatalog levels)
         {
             _db = db;
             _clock = clock;
+            _lessons = lessons;
+            _levels = levels;
         }
 
         public async Task<QuizResponseDto> GetByIdAsync(int quizId, CancellationToken cancellationToken = default)
@@ -91,6 +101,80 @@ namespace AssessmentBL.Services
             };
         }
 
+        public async Task<LessonQuizResponseDto> GetForLessonAsync(
+            int lessonId,
+            string? language = null,
+            CancellationToken cancellationToken = default)
+        {
+            var resolvedLanguage = ContentLanguages.Normalize(language);
+
+            // Lessons live in the Content module and Quizzes.LessonId has no FK
+            // (see QuizConfiguration), so existence and visibility are asked of
+            // that module rather than assumed. A lesson a child cannot see is
+            // reported exactly like one that does not exist.
+            var isPublished = await _lessons.IsPublishedAsync(lessonId, cancellationToken);
+
+            if (isPublished != true)
+                throw new KeyNotFoundException($"الدرس رقم {lessonId} غير موجود");
+
+            // CK_Quizzes_TypeMatchesReference ties a LessonQuiz to exactly one
+            // lesson, but nothing stops a lesson having several; the newest active
+            // one with at least one active question wins, deterministically.
+            var quiz = await _db.Quizzes
+                .AsNoTracking()
+                .Where(q => q.LessonId == lessonId
+                         && q.QuizType == QuizTypes.LessonQuiz
+                         && q.IsActive
+                         && q.Questions.Any(question => question.IsActive))
+                .OrderByDescending(q => q.Id)
+                .Select(q => new
+                {
+                    q.Id,
+                    Title =
+                        q.QuizTranslations
+                            .Where(t => t.LanguageCode == resolvedLanguage)
+                            .Select(t => t.Title)
+                            .FirstOrDefault()
+                        ?? q.QuizTranslations
+                            .Where(t => t.LanguageCode == ContentLanguages.Fallback)
+                            .Select(t => t.Title)
+                            .FirstOrDefault()
+                        ?? q.Title,
+                    Description =
+                        q.QuizTranslations
+                            .Where(t => t.LanguageCode == resolvedLanguage)
+                            .Select(t => t.Description)
+                            .FirstOrDefault()
+                        ?? q.QuizTranslations
+                            .Where(t => t.LanguageCode == ContentLanguages.Fallback)
+                            .Select(t => t.Description)
+                            .FirstOrDefault()
+                        ?? q.Description,
+                    HasRequestedTranslation = q.QuizTranslations.Any(t => t.LanguageCode == resolvedLanguage)
+                })
+                .FirstOrDefaultAsync(cancellationToken)
+                ?? throw new KeyNotFoundException($"لا يوجد اختبار متاح للدرس رقم {lessonId}");
+
+            // Same child-safe projection the attempt endpoints use: no IsCorrect,
+            // no image descriptions, questions and options in DisplayOrder.
+            var questions = await LocalizedQuestionQuery.Project(
+                    _db.Questions.AsNoTracking().Where(q => q.QuizId == quiz.Id && q.IsActive),
+                    resolvedLanguage)
+                .ToListAsync(cancellationToken);
+
+            return new LessonQuizResponseDto
+            {
+                QuizId = quiz.Id,
+                LessonId = lessonId,
+                Title = quiz.Title,
+                Description = quiz.Description,
+                TotalQuestions = (short)questions.Count,
+                Language = resolvedLanguage,
+                LanguageFallbackApplied = !quiz.HasRequestedTranslation || questions.Any(r => r.UsedFallback),
+                Questions = questions.Select(r => r.ToDto()).ToList()
+            };
+        }
+
         public async Task<QuizResponseDto> CreateAsync(CreateQuizDto request, CancellationToken cancellationToken = default)
         {
             var title = NormalizeTitle(request.Title);
@@ -100,6 +184,10 @@ namespace AssessmentBL.Services
 
             ValidateQuizType(quizType);
             ValidateTypeMatchesReference(quizType, request.LevelId, request.LessonId);
+            await EnsureReferenceExistsAsync(request.LevelId, request.LessonId, cancellationToken);
+
+            // A new quiz starts active, so the one-active-per-slot rule applies now.
+            await EnsureSlotIsFreeAsync(quizType, request.LessonId, excludingQuizId: null, cancellationToken);
 
             var quiz = new Quiz
             {
@@ -116,7 +204,7 @@ namespace AssessmentBL.Services
             };
 
             _db.Quizzes.Add(quiz);
-            await _db.SaveChangesAsync(cancellationToken: cancellationToken);
+            await SaveWithSlotConflictAsync(cancellationToken);
 
             return ToResponse(quiz);
         }
@@ -130,12 +218,15 @@ namespace AssessmentBL.Services
             // design — a quiz cannot be re-pointed at a different level or
             // lesson after creation, which also keeps
             // CK_Quizzes_TypeMatchesReference satisfied.
+            if (request.IsActive && !quiz.IsActive)
+                await EnsureSlotIsFreeAsync(quiz.QuizType, quiz.LessonId, quizId, cancellationToken);
+
             quiz.Title = NormalizeTitle(request.Title);
             quiz.Description = request.Description;
             quiz.IsActive = request.IsActive;
             quiz.UpdatedAt = _clock.UtcNow;
 
-            await _db.SaveChangesAsync(cancellationToken: cancellationToken);
+            await SaveWithSlotConflictAsync(cancellationToken);
 
             return ToResponse(quiz);
         }
@@ -148,10 +239,82 @@ namespace AssessmentBL.Services
             if (quiz.IsActive == isActive)
                 return;
 
+            if (isActive)
+                await EnsureSlotIsFreeAsync(quiz.QuizType, quiz.LessonId, quizId, cancellationToken);
+
             quiz.IsActive = isActive;
             quiz.UpdatedAt = _clock.UtcNow;
 
-            await _db.SaveChangesAsync(cancellationToken: cancellationToken);
+            await SaveWithSlotConflictAsync(cancellationToken);
+        }
+
+        /// <summary>
+        /// LevelId / LessonId point into the Content module with no FK (see
+        /// QuizConfiguration), so their existence is checked here instead. An
+        /// unpublished lesson is allowed — its quiz is authored before release.
+        /// </summary>
+        private async Task EnsureReferenceExistsAsync(int? levelId, int? lessonId, CancellationToken cancellationToken)
+        {
+            if (lessonId is int lesson && await _lessons.IsPublishedAsync(lesson, cancellationToken) is null)
+                throw new KeyNotFoundException($"الدرس رقم {lesson} غير موجود");
+
+            if (levelId is int level)
+            {
+                var levels = await _levels.GetLevelsInOrderAsync(cancellationToken);
+
+                if (!levels.Any(l => l.Id == level))
+                    throw new KeyNotFoundException($"المستوى رقم {level} غير موجود");
+            }
+        }
+
+        /// <summary>
+        /// One active Placement quiz overall, and one active LessonQuiz per lesson —
+        /// otherwise which quiz a child gets would be a guess. Mirrors the filtered
+        /// unique indexes of migration 007; this turns the common case into a
+        /// readable message, SaveWithSlotConflictAsync covers the race.
+        /// </summary>
+        private async Task EnsureSlotIsFreeAsync(
+            string quizType,
+            int? lessonId,
+            int? excludingQuizId,
+            CancellationToken cancellationToken)
+        {
+            var taken = quizType switch
+            {
+                QuizTypes.Placement => await _db.Quizzes.AsNoTracking().AnyAsync(
+                    q => q.QuizType == QuizTypes.Placement
+                      && q.IsActive
+                      && (excludingQuizId == null || q.Id != excludingQuizId.Value),
+                    cancellationToken),
+
+                QuizTypes.LessonQuiz => await _db.Quizzes.AsNoTracking().AnyAsync(
+                    q => q.QuizType == QuizTypes.LessonQuiz
+                      && q.LessonId == lessonId
+                      && q.IsActive
+                      && (excludingQuizId == null || q.Id != excludingQuizId.Value),
+                    cancellationToken),
+
+                _ => false
+            };
+
+            if (taken)
+                throw new ConflictException(quizType == QuizTypes.Placement
+                    ? "يوجد اختبار تحديد مستوى مفعّل بالفعل، أوقفه أولًا"
+                    : $"يوجد اختبار مفعّل بالفعل للدرس رقم {lessonId}، أوقفه أولًا");
+        }
+
+        private async Task SaveWithSlotConflictAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                await _db.SaveChangesAsync(cancellationToken);
+            }
+            catch (DbUpdateException ex) when (
+                ex.IsUniqueViolationOf("UQ_Quizzes_OneActivePlacement")
+             || ex.IsUniqueViolationOf("UQ_Quizzes_OneActiveLessonQuizPerLesson"))
+            {
+                throw new ConflictException("يوجد اختبار مفعّل آخر لنفس الغرض، أوقفه أولًا", ex);
+            }
         }
 
         private static string NormalizeTitle(string? title)
@@ -180,7 +343,7 @@ namespace AssessmentBL.Services
             {
                 QuizTypes.LevelAssessment => levelId.HasValue && !lessonId.HasValue,
                 QuizTypes.LessonQuiz or QuizTypes.LessonReview => lessonId.HasValue && !levelId.HasValue,
-                QuizTypes.Standalone => !levelId.HasValue && !lessonId.HasValue,
+                QuizTypes.Standalone or QuizTypes.Placement => !levelId.HasValue && !lessonId.HasValue,
                 _ => false
             };
 

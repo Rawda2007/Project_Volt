@@ -1,10 +1,14 @@
-﻿using System.Net;
+using System.Net;
 using System.Text.Json;
+using Shared.Common.Api;
 using Shared.Common.Exceptions;
 namespace ElectroWorld.Middleware
 {
     public class ExceptionMiddleware
     {
+        // Web defaults → camelCase, matching every other response in the API.
+        private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
         private readonly RequestDelegate _next;
         private readonly ILogger<ExceptionMiddleware> _logger;
 
@@ -22,49 +26,76 @@ namespace ElectroWorld.Middleware
             {
                 await _next(context);
             }
+            catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+            {
+                // The client went away. Nobody is waiting for an answer and nothing
+                // failed on our side, so this is neither an error nor a 500.
+                _logger.LogInformation(
+                    "Request {Method} {Path} was aborted by the client.",
+                    context.Request.Method, context.Request.Path);
+            }
             catch (Exception ex)
             {
-                _logger.LogError(
-                    ex,
-                    "Unhandled exception occurred while processing the request.");
+                var statusCode = MapStatusCode(ex);
 
-                await HandleExceptionAsync(context, ex);
+                // Only server faults are errors. A 4xx is the caller's mistake or an
+                // expected business rule; logging it at Error buried the real ones.
+                if (statusCode >= 500)
+                    _logger.LogError(ex, "Unhandled exception occurred while processing the request.");
+                else
+                    _logger.LogWarning(
+                        "Request {Method} {Path} failed with {StatusCode}: {Message}",
+                        context.Request.Method, context.Request.Path, statusCode, ex.Message);
+
+                if (context.Response.HasStarted)
+                {
+                    // Headers are already on the wire; writing a body now would throw.
+                    _logger.LogWarning("The response had already started, so the error could not be written.");
+                    throw;
+                }
+
+                await WriteErrorAsync(context, ex, statusCode);
             }
         }
 
-        private static async Task HandleExceptionAsync(
-    HttpContext context,
-    Exception exception)
+        // ArgumentException appends " (Parameter 'dto')" to Message — an internal
+        // parameter name the app would otherwise show the child.
+        private static string ClientMessage(Exception exception) =>
+            exception is ArgumentException { ParamName: { } param } argument
+                ? argument.Message.Replace($" (Parameter '{param}')", string.Empty)
+                : exception.Message;
+
+        private static int MapStatusCode(Exception exception) => exception switch
         {
-            context.Response.ContentType = "application/json";
+            KeyNotFoundException => (int)HttpStatusCode.NotFound,
+            ConflictException => (int)HttpStatusCode.Conflict,
+            GoneException => (int)HttpStatusCode.Gone,
+            ArgumentException => (int)HttpStatusCode.BadRequest,
+            InvalidOperationException => (int)HttpStatusCode.BadRequest,
+            UnauthorizedAccessException => (int)HttpStatusCode.Forbidden,
+            _ => (int)HttpStatusCode.InternalServerError
+        };
 
-            var statusCode = exception switch
-            {
-                KeyNotFoundException => (int)HttpStatusCode.NotFound,
-                ConflictException => (int)HttpStatusCode.Conflict,
-                ArgumentException => (int)HttpStatusCode.BadRequest,
-                InvalidOperationException => (int)HttpStatusCode.BadRequest,
-                UnauthorizedAccessException => (int)HttpStatusCode.Forbidden,
-                _ => (int)HttpStatusCode.InternalServerError
-            };
-
+        private static async Task WriteErrorAsync(
+            HttpContext context,
+            Exception exception,
+            int statusCode)
+        {
+            context.Response.ContentType = "application/json; charset=utf-8";
             context.Response.StatusCode = statusCode;
 
             var message = statusCode == (int)HttpStatusCode.InternalServerError
                 ? "حدث خطأ داخلي في الخادم"
-                : exception.Message;
+                : ClientMessage(exception);
 
-            var response = new
-            {
-                statusCode,
-                message
-            };
+            // The shared envelope, so every failure in the API has one shape.
+            // ⚠ BREAKING CHANGE for existing Assessment clients, which previously
+            // received { statusCode, message }. Coordinate with the Flutter team.
+            // To revert, restore the anonymous { statusCode, message } object.
+            var response = ApiResponse<object>.Fail(message);
 
             await context.Response.WriteAsync(
-                JsonSerializer.Serialize(response));
+                JsonSerializer.Serialize(response, JsonOptions));
         }
     }
 }
-
-
-

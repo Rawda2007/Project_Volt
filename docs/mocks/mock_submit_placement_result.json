@@ -1,0 +1,50 @@
+{
+  "attemptId": 58,
+  "quizId": 7,
+  "completedAt": "2026-09-11T16:05:42.310",
+  "totalQuestions": 12,
+  "autoGradedQuestions": 12,
+  "pendingEssayQuestions": 0,
+  "essayResults": [],
+  "correctAnswers": 7,
+  "wrongAnswers": 5,
+  "scorePercentage": 58.33,
+  "language": "ar",
+  "languageFallbackApplied": false,
+  "hintsStatus": "NotRequired",
+  "retryQuestions": [],
+  "placement": {
+    "levelId": 2,
+    "levelTitle": "المستوى الثاني: الدوائر الكهربية",
+    "levelOrder": 2,
+    "scorePercentage": 58.33,
+    "passPercentage": 75,
+    "placedAt": "2026-09-11T16:05:42.310",
+    "levels": [
+      {
+        "levelId": 1,
+        "levelTitle": "المستوى الأول: أساسيات الكهرباء",
+        "questionsAsked": 4,
+        "correctAnswers": 4,
+        "scorePercentage": 100.0,
+        "mastered": true
+      },
+      {
+        "levelId": 2,
+        "levelTitle": "المستوى الثاني: الدوائر الكهربية",
+        "questionsAsked": 4,
+        "correctAnswers": 2,
+        "scorePercentage": 50.0,
+        "mastered": false
+      },
+      {
+        "levelId": 3,
+        "levelTitle": "المستوى الثالث: القياسات",
+        "questionsAsked": 4,
+        "correctAnswers": 1,
+        "scorePercentage": 25.0,
+        "mastered": false
+      }
+    ]
+  }
+}

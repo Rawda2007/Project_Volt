@@ -17,5 +17,14 @@ namespace AssessmentBL.Interfaces
             long quizAttemptId,
             Guid userId,
             CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Recomputes HintsUsedCount for the (topic, difficulty) buckets of one
+        /// attempt from the hints saved so far. Idempotent.
+        /// </summary>
+        Task RefreshHintsUsedCountAsync(
+            long quizAttemptId,
+            Guid userId,
+            CancellationToken cancellationToken = default);
     }
 }

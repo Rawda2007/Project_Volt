@@ -1,0 +1,25 @@
+{
+  "attemptId": 44,
+  "quizId": 15,
+  "completedAt": "2026-09-10T18:42:10.123",
+  "totalQuestions": 1,
+  "autoGradedQuestions": 0,
+  "pendingEssayQuestions": 1,
+  "essayResults": [
+    {
+      "questionId": 104,
+      "status": "Pending",
+      "awardedPoints": null,
+      "maxPoints": 3,
+      "feedback": null,
+      "gradedBy": null
+    }
+  ],
+  "correctAnswers": 0,
+  "wrongAnswers": 0,
+  "scorePercentage": 0.0,
+  "language": "ar",
+  "languageFallbackApplied": false,
+  "hintsStatus": "NotRequired",
+  "retryQuestions": []
+}

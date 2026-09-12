@@ -14,4 +14,7 @@ public partial class Category
     public bool IsActive { get; set; }
 
     public virtual ICollection<Topic> Topics { get; set; } = new List<Topic>();
+
+    public virtual ICollection<CategoryTranslation> CategoryTranslations { get; set; }
+        = new List<CategoryTranslation>();
 }

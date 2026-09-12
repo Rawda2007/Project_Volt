@@ -24,6 +24,11 @@ public static class UsersModule
         services.AddScoped<IAuthService, AuthService>();
         services.AddScoped<IUserService, UserService>();
 
+        // [Assessment-AI] Registration only, for the Shared contract Assessment
+        // consumes to read a learner's age for AI hints. Nothing else in Users
+        // changed. See LearnerProfileService.
+        services.AddScoped<Shared.Users.ILearnerProfile, LearnerProfileService>();
+
         return services;
     }
 }

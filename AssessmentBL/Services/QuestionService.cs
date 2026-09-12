@@ -22,6 +22,9 @@ namespace AssessmentBL.Services
                 QuizId = question.QuizId,
                 TopicId = question.TopicId,
                 QuestionText = question.QuestionText,
+                QuestionType = question.QuestionType,
+                ImageUrl = question.ImageUrl,
+                ImageDescription = question.ImageDescription,
                 Difficulty = question.Difficulty,
                 DisplayOrder = question.DisplayOrder,
                 Points = question.Points,
@@ -33,6 +36,8 @@ namespace AssessmentBL.Services
                     {
                         Id = o.Id,
                         OptionText = o.OptionText,
+                        ImageUrl = o.ImageUrl,
+                        ImageDescription = o.ImageDescription,
                         IsCorrect = o.IsCorrect,
                         DisplayOrder = o.DisplayOrder
                     })
@@ -71,9 +76,19 @@ namespace AssessmentBL.Services
 
         public async Task<AdminQuestionResponseDto> CreateQuestionAsync(CreateQuestionDto request, CancellationToken cancellationToken = default)
         {
-            var quizExists = await _db.Quizzes.AsNoTracking().AnyAsync(q => q.Id == request.QuizId, cancellationToken: cancellationToken);
-            if (!quizExists)
-                throw new KeyNotFoundException($"الاختبار رقم {request.QuizId} غير موجود");
+            var quizType = await _db.Quizzes
+                .AsNoTracking()
+                .Where(q => q.Id == request.QuizId)
+                .Select(q => q.QuizType)
+                .FirstOrDefaultAsync(cancellationToken)
+                ?? throw new KeyNotFoundException($"الاختبار رقم {request.QuizId} غير موجود");
+
+            // The placement quiz owns no questions: it samples each level's
+            // LevelAssessment quiz (PlacementEngine). A question added here would
+            // never be asked.
+            if (quizType == QuizTypes.Placement)
+                throw new InvalidOperationException(
+                    "اختبار تحديد المستوى يأخذ أسئلته من اختبارات تقييم المستويات، أضف السؤال إلى اختبار تقييم المستوى المناسب");
 
             var topicExists = await _db.Topics.AsNoTracking().AnyAsync(t => t.Id == request.TopicId, cancellationToken: cancellationToken);
             if (!topicExists)
@@ -81,6 +96,7 @@ namespace AssessmentBL.Services
 
             var questionText = NormalizeQuestionText(request.QuestionText);
             var difficulty = NormalizeDifficulty(request.Difficulty);
+            var questionType = NormalizeQuestionType(request.QuestionType);
             var points = NormalizePoints(request.Points);
 
             await EnsureDisplayOrderIsFreeAsync(request.QuizId, request.DisplayOrder, excludingQuestionId: null, cancellationToken: cancellationToken);
@@ -90,6 +106,9 @@ namespace AssessmentBL.Services
                 QuizId = request.QuizId,
                 TopicId = request.TopicId,
                 QuestionText = questionText,
+                QuestionType = questionType,
+                ImageUrl = NormalizeImageUrl(request.ImageUrl),
+                ImageDescription = NormalizeImageUrl(request.ImageDescription),
                 Difficulty = difficulty,
                 DisplayOrder = request.DisplayOrder,
                 Points = points
@@ -119,16 +138,25 @@ namespace AssessmentBL.Services
 
             var questionText = NormalizeQuestionText(request.QuestionText);
             var difficulty = NormalizeDifficulty(request.Difficulty);
+            var questionType = string.IsNullOrWhiteSpace(request.QuestionType)
+                ? question.QuestionType
+                : NormalizeQuestionType(request.QuestionType);
             var points = NormalizePoints(request.Points);
 
             if (question.DisplayOrder != request.DisplayOrder)
                 await EnsureDisplayOrderIsFreeAsync(question.QuizId, request.DisplayOrder, excludingQuestionId: questionId, cancellationToken: cancellationToken);
+
+            // Changing type is only safe while the option set still matches the
+            // new type's rules, so validate against the type being saved.
             if (request.IsActive)
-                await EnsureExactlyOneCorrectOptionAsync(questionId, cancellationToken: cancellationToken);
+                await EnsureAnswerableAsync(questionId, questionType, cancellationToken);
             // QuizId is not part of UpdateQuestionDto — a question cannot be
             // moved to another quiz, which keeps existing attempt history sane.
             question.TopicId = request.TopicId;
             question.QuestionText = questionText;
+            question.QuestionType = questionType;
+            question.ImageUrl = NormalizeImageUrl(request.ImageUrl);
+            question.ImageDescription = NormalizeImageUrl(request.ImageDescription);
             question.Difficulty = difficulty;
             question.DisplayOrder = request.DisplayOrder;
             question.Points = points;
@@ -148,7 +176,7 @@ namespace AssessmentBL.Services
                 return;
 
             if (isActive)
-                await EnsureExactlyOneCorrectOptionAsync(questionId, cancellationToken: cancellationToken);
+                await EnsureAnswerableAsync(questionId, question.QuestionType, cancellationToken);
 
             question.IsActive = isActive;
 
@@ -206,17 +234,58 @@ namespace AssessmentBL.Services
 
             return difficulty;
         }
-        private async Task EnsureExactlyOneCorrectOptionAsync(
-    int questionId, CancellationToken cancellationToken = default)
+        // Mirrors CK_Questions_QuestionType.
+        private static string NormalizeQuestionType(string? questionType)
         {
-            var correctOptionsCount = await _db.QuestionOptions
-                .AsNoTracking()
-                .CountAsync(o =>
-                    o.QuestionId == questionId &&
-                    o.IsCorrect,
-                    cancellationToken: cancellationToken);
+            if (string.IsNullOrWhiteSpace(questionType))
+                return QuestionTypes.MultipleChoice;
 
-            if (correctOptionsCount != 1)
+            if (!QuestionTypes.All.Contains(questionType))
+                throw new ArgumentException($"نوع السؤال '{questionType}' غير صالح", nameof(questionType));
+
+            return questionType;
+        }
+
+        private static string? NormalizeImageUrl(string? imageUrl) =>
+            string.IsNullOrWhiteSpace(imageUrl) ? null : imageUrl.Trim();
+
+        /// <summary>
+        /// A question may only be activated when its options match its type:
+        /// MultipleChoice needs at least two options and exactly one correct,
+        /// TrueFalse needs exactly two options and exactly one correct, and an
+        /// Essay must have none at all.
+        /// </summary>
+        private async Task EnsureAnswerableAsync(
+            int questionId, string questionType, CancellationToken cancellationToken = default)
+        {
+            var counts = await _db.QuestionOptions
+                .AsNoTracking()
+                .Where(o => o.QuestionId == questionId)
+                .GroupBy(o => 1)
+                .Select(g => new { Total = g.Count(), Correct = g.Count(o => o.IsCorrect) })
+                .FirstOrDefaultAsync(cancellationToken);
+
+            var total = counts?.Total ?? 0;
+            var correct = counts?.Correct ?? 0;
+
+            if (questionType == QuestionTypes.Essay)
+            {
+                if (total > 0)
+                    throw new InvalidOperationException(
+                        $"السؤال المقالي رقم {questionId} لا يجب أن يحتوي على اختيارات");
+
+                return;
+            }
+
+            if (questionType == QuestionTypes.TrueFalse && total != 2)
+                throw new InvalidOperationException(
+                    $"سؤال الصح والخطأ رقم {questionId} يجب أن يحتوي على اختيارين بالضبط");
+
+            if (questionType == QuestionTypes.MultipleChoice && total < 2)
+                throw new InvalidOperationException(
+                    $"السؤال رقم {questionId} يجب أن يحتوي على اختيارين على الأقل قبل تفعيله");
+
+            if (correct != 1)
                 throw new InvalidOperationException(
                     $"السؤال رقم {questionId} يجب أن يحتوي على إجابة صحيحة واحدة بالضبط قبل تفعيله");
         }

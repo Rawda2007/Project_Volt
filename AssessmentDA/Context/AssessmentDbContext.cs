@@ -33,6 +33,22 @@ public partial class AssessmentDbContext : DbContext
     public virtual DbSet<UserTopicStat> UserTopicStats { get; set; }
     public virtual DbSet<QuizAttemptQuestion> QuizAttemptQuestions { get; set; }
 
+    public virtual DbSet<QuizAttemptEssayAnswer> QuizAttemptEssayAnswers { get; set; }
+
+    public virtual DbSet<Language> Languages { get; set; }
+
+    public virtual DbSet<QuizTranslation> QuizTranslations { get; set; }
+
+    public virtual DbSet<QuestionTranslation> QuestionTranslations { get; set; }
+
+    public virtual DbSet<QuestionOptionTranslation> QuestionOptionTranslations { get; set; }
+
+    public virtual DbSet<TopicTranslation> TopicTranslations { get; set; }
+
+    public virtual DbSet<CategoryTranslation> CategoryTranslations { get; set; }
+
+    public virtual DbSet<UserPlacement> UserPlacements { get; set; }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(AssessmentDbContext).Assembly);

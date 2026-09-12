@@ -14,6 +14,8 @@ public static class DependencyInjection
         services.Configure<AiSettings>(configuration.GetSection(AiSettings.SectionName));
         services.AddHttpClient<IExternalAiProvider, HttpExternalAiProvider>();
         services.AddScoped<IAiHintGenerator, AiHintGenerator>();
+        services.AddScoped<IAiHintButton, AiHintButton>();
+        services.AddScoped<IAiEssayEvaluator, AiEssayEvaluator>();
         return services;
     }
 }

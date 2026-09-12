@@ -4,6 +4,7 @@ using AssessmentDA.Context;
 using AssessmentDA.Entities;
 using Microsoft.EntityFrameworkCore;
 using System.Linq.Expressions;
+using AssessmentBL.Services.Constants;
 using Shared.Common.Exceptions;
 
 namespace AssessmentBL.Services
@@ -16,6 +17,8 @@ namespace AssessmentBL.Services
             {
                 Id = option.Id,
                 OptionText = option.OptionText,
+                ImageUrl = option.ImageUrl,
+                ImageDescription = option.ImageDescription,
                 IsCorrect = option.IsCorrect,
                 DisplayOrder = option.DisplayOrder
             };
@@ -44,7 +47,10 @@ namespace AssessmentBL.Services
             if (!questionExists)
                 throw new KeyNotFoundException($"السؤال رقم {request.QuestionId} غير موجود");
 
-            var optionText = NormalizeOptionText(request.OptionText);
+            var (optionText, imageUrl, imageDescription) =
+                NormalizeContent(request.OptionText, request.ImageUrl, request.ImageDescription);
+
+            await EnsureQuestionAcceptsOptionsAsync(request.QuestionId, cancellationToken);
 
             await EnsureDisplayOrderIsFreeAsync(request.QuestionId, request.DisplayOrder, excludingOptionId: null, cancellationToken: cancellationToken);
 
@@ -55,6 +61,8 @@ namespace AssessmentBL.Services
             {
                 QuestionId = request.QuestionId,
                 OptionText = optionText,
+                ImageUrl = imageUrl,
+                ImageDescription = imageDescription,
                 IsCorrect = request.IsCorrect,
                 DisplayOrder = request.DisplayOrder
                 // CreatedAt is filled by the sysutcdatetime() column default.
@@ -74,7 +82,8 @@ namespace AssessmentBL.Services
                 .FirstOrDefaultAsync(o => o.Id == optionId, cancellationToken: cancellationToken)
                 ?? throw new KeyNotFoundException($"الاختيار رقم {optionId} غير موجود");
 
-            var optionText = NormalizeOptionText(request.OptionText);
+            var (optionText, imageUrl, imageDescription) =
+                NormalizeContent(request.OptionText, request.ImageUrl, request.ImageDescription);
 
             if (option.DisplayOrder != request.DisplayOrder)
                 await EnsureDisplayOrderIsFreeAsync(
@@ -110,6 +119,8 @@ namespace AssessmentBL.Services
             }
 
             option.OptionText = optionText;
+            option.ImageUrl = imageUrl;
+            option.ImageDescription = imageDescription;
             option.IsCorrect = request.IsCorrect;
             option.DisplayOrder = request.DisplayOrder;
 
@@ -141,11 +152,20 @@ namespace AssessmentBL.Services
                 throw new InvalidOperationException(
                     $"لا يمكن حذف الاختيار رقم {optionId} لأنه الإجابة الصحيحة المسجّلة في محاولات سابقة");
 
-            var questionIsActive = await _db.Questions
+            var question = await _db.Questions
                 .AsNoTracking()
                 .Where(q => q.Id == option.QuestionId)
-                .Select(q => q.IsActive)
+                .Select(q => new { q.IsActive, OptionCount = q.QuestionOptions.Count() })
                 .FirstAsync(cancellationToken: cancellationToken);
+
+            // A published question must stay answerable: MultipleChoice needs at
+            // least two options and TrueFalse exactly two — the rule SetActiveAsync
+            // enforced when it was published.
+            if (question.IsActive && question.OptionCount <= 2)
+                throw new InvalidOperationException(
+                    $"لا يمكن حذف الاختيار رقم {optionId}: السؤال رقم {option.QuestionId} مفعّل ويحتاج إلى اختيارين على الأقل");
+
+            var questionIsActive = question.IsActive;
 
             if (questionIsActive && option.IsCorrect)
             {
@@ -218,18 +238,62 @@ namespace AssessmentBL.Services
                     $"السؤال رقم {questionId} له إجابة صحيحة بالفعل");
         }
 
-        private static string NormalizeOptionText(string? optionText)
+        /// <summary>
+        /// An option may be text-only, image-only, or both — but never neither.
+        /// Mirrors CK_QuestionOptions_TextOrImage so the admin gets a clear message
+        /// instead of a raw check-constraint violation.
+        /// </summary>
+        private static (string? OptionText, string? ImageUrl, string? ImageDescription) NormalizeContent(
+            string? optionText, string? imageUrl, string? imageDescription)
         {
-            if (string.IsNullOrWhiteSpace(optionText))
-                throw new ArgumentException("نص الاختيار مطلوب", nameof(optionText));
+            var text = string.IsNullOrWhiteSpace(optionText) ? null : optionText.Trim();
+            var image = string.IsNullOrWhiteSpace(imageUrl) ? null : imageUrl.Trim();
+            var description = string.IsNullOrWhiteSpace(imageDescription) ? null : imageDescription.Trim();
 
-            return optionText.Trim();
+            if (text is null && image is null)
+                throw new ArgumentException(
+                    "الاختيار يجب أن يحتوي على نص أو صورة على الأقل", nameof(optionText));
+
+            // Mirrors CK_QuestionOptions_ImageOptionHasDescription. An option the
+            // child can only see as an image must carry a description, or the AI
+            // receives nothing for the child's answer and no hint can be produced.
+            if (text is null && description is null)
+                throw new ArgumentException(
+                    "الاختيار الذي يعتمد على صورة فقط يجب أن يحتوي على وصف للصورة حتى يتمكن النظام من تحليل إجابة الطالب",
+                    nameof(imageDescription));
+
+            return (text, image, description);
+        }
+
+        /// <summary>
+        /// An Essay question has no options and must never be given any, and a
+        /// TrueFalse question has exactly two. Checked on every add, not only at
+        /// activation — otherwise a published TrueFalse could gain a third option.
+        /// </summary>
+        private async Task EnsureQuestionAcceptsOptionsAsync(
+            int questionId, CancellationToken cancellationToken = default)
+        {
+            var question = await _db.Questions
+                .AsNoTracking()
+                .Where(q => q.Id == questionId)
+                .Select(q => new { q.QuestionType, OptionCount = q.QuestionOptions.Count() })
+                .FirstAsync(cancellationToken);
+
+            if (!QuestionTypes.UsesOptions(question.QuestionType))
+                throw new InvalidOperationException(
+                    $"السؤال رقم {questionId} سؤال مقالي ولا يقبل اختيارات");
+
+            if (question.QuestionType == QuestionTypes.TrueFalse && question.OptionCount >= 2)
+                throw new InvalidOperationException(
+                    $"سؤال الصح والخطأ رقم {questionId} له اختياران بالفعل");
         }
 
         private static AdminQuestionOptionResponseDto ToResponse(QuestionOption option) => new()
         {
             Id = option.Id,
             OptionText = option.OptionText,
+            ImageUrl = option.ImageUrl,
+            ImageDescription = option.ImageDescription,
             IsCorrect = option.IsCorrect,
             DisplayOrder = option.DisplayOrder
         };

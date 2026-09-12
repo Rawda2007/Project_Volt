@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 
 namespace AssessmentDA.Entities;
 
@@ -26,6 +27,13 @@ public partial class UserTopicStat
     public DateTime? LastPracticedAt { get; set; }
 
     public DateTime UpdatedAt { get; set; }
+
+    /// <summary>
+    /// Makes the read-modify-write in UpdateAfterQuizAttemptAsync safe: two
+    /// submissions updating the same row at once no longer lose one set of
+    /// counts — the second gets a concurrency conflict and is retried.
+    /// </summary>
+    [Timestamp] public byte[] RowVersion { get; set; } = null!;
 
     public virtual QuizAttempt? LastQuizAttempt { get; set; }
 

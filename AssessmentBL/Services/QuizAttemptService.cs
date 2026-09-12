@@ -1,81 +1,132 @@
-﻿using AssessmentBL.DTOs.QuizAttempt;
+using AssessmentBL.DTOs.Placement;
+using AssessmentBL.DTOs.QuizAttempt;
 using AssessmentBL.Interfaces;
 using AssessmentBL.Services.Constants;
 using AssessmentDA.Context;
 using AssessmentDA.Entities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Shared.Assessment.AI;
 using Shared.Common.Abstractions;
 using Shared.Common.Exceptions;
+using Shared.Content;
+using Shared.Users;
 
 namespace AssessmentBL.Services
 {
     public class QuizAttemptService : IQuizAttemptService
     {
+        // Rows flipped per UPDATE by the abandoned-attempt sweep, so one run never
+        // holds a long lock on QuizAttempts however large the backlog is.
+        private const int AbandonSweepBatchSize = 500;
+
+        private const string AlreadyPlacedMessage = "تم تحديد مستواك بالفعل، لا يمكن إعادة اختبار تحديد المستوى";
+
+        private static readonly IReadOnlyDictionary<int, string> NoHints = new Dictionary<int, string>();
+
         private readonly AssessmentDbContext _db;
         private readonly IUserTopicStatService _userTopicStatService;
         private readonly IDateTimeProvider _clock;
         private readonly IAiHintGenerator _aiHintGenerator;
+        private readonly IEssayEvaluationService _essays;
+        private readonly AiRequestBuilder _aiRequests;
+        private readonly ILearnerProfile _learners;
+        private readonly ILessonAvailability _lessons;
+        private readonly PlacementEngine _placement;
+        private readonly AssessmentSettings _settings;
+        private readonly ILogger<QuizAttemptService> _logger;
 
         public QuizAttemptService(
             AssessmentDbContext db,
             IUserTopicStatService userTopicStatService,
             IDateTimeProvider clock,
-            IAiHintGenerator aiHintGenerator)
+            IAiHintGenerator aiHintGenerator,
+            IEssayEvaluationService essays,
+            AiRequestBuilder aiRequests,
+            ILearnerProfile learners,
+            ILessonAvailability lessons,
+            PlacementEngine placement,
+            IOptions<AssessmentSettings> settings,
+            ILogger<QuizAttemptService> logger)
         {
             _db = db;
             _userTopicStatService = userTopicStatService;
             _clock = clock;
             _aiHintGenerator = aiHintGenerator;
+            _essays = essays;
+            _aiRequests = aiRequests;
+            _learners = learners;
+            _lessons = lessons;
+            _placement = placement;
+            _settings = settings.Value;
+            _logger = logger;
         }
 
         public async Task<QuizAttemptResponseDto> StartAsync(
             int quizId,
             Guid userId,
             long? previousAttemptId = null,
+            string? language = null,
             CancellationToken cancellationToken = default)
         {
-            var quizIsActive = await _db.Quizzes
+            var resolvedLanguage = ContentLanguages.Normalize(language);
+
+            var quiz = await _db.Quizzes
                 .AsNoTracking()
                 .Where(q => q.Id == quizId)
-                .Select(q => (bool?)q.IsActive)
-                .FirstOrDefaultAsync(cancellationToken);
+                .Select(q => new { q.IsActive, q.QuizType, q.LessonId })
+                .FirstOrDefaultAsync(cancellationToken)
+                ?? throw new KeyNotFoundException($"الاختبار رقم {quizId} غير موجود");
 
-            if (quizIsActive is null)
-                throw new KeyNotFoundException($"الاختبار رقم {quizId} غير موجود");
-
-            if (quizIsActive == false)
+            if (!quiz.IsActive)
                 throw new InvalidOperationException($"الاختبار رقم {quizId} غير مفعّل");
 
+            // A lesson's quiz is open only while the lesson is visible to learners —
+            // the same rule GET /api/quizzes/for-lesson applies.
+            if (quiz.LessonId is int lessonId
+                && await _lessons.IsPublishedAsync(lessonId, cancellationToken) != true)
+                throw new KeyNotFoundException($"الاختبار رقم {quizId} غير متاح");
+
+            if (quiz.QuizType == QuizTypes.Placement)
+            {
+                if (previousAttemptId is not null)
+                    throw new InvalidOperationException("اختبار تحديد المستوى لا تتم إعادته");
+
+                return await StartPlacementAttemptAsync(quizId, userId, resolvedLanguage, cancellationToken);
+            }
+
             return previousAttemptId is null
-                ? await StartFirstAttemptAsync(quizId, userId, cancellationToken)
-                : await StartRetryAttemptAsync(quizId, userId, previousAttemptId.Value, cancellationToken);
+                ? await StartFirstAttemptAsync(quizId, userId, resolvedLanguage, cancellationToken)
+                : await StartRetryAttemptAsync(quizId, userId, previousAttemptId.Value, resolvedLanguage, cancellationToken);
         }
 
         private async Task<QuizAttemptResponseDto> StartFirstAttemptAsync(
             int quizId,
             Guid userId,
+            string language,
             CancellationToken cancellationToken)
         {
-            var questions = await ProjectQuestions(
-                    _db.Questions.AsNoTracking().Where(q => q.QuizId == quizId && q.IsActive))
+            var rows = await LocalizedQuestionQuery.Project(
+                    _db.Questions.AsNoTracking().Where(q => q.QuizId == quizId && q.IsActive), language)
                 .ToListAsync(cancellationToken);
 
-            if (questions.Count == 0)
+            if (rows.Count == 0)
                 throw new InvalidOperationException(
                     $"الاختبار رقم {quizId} لا يحتوي على أسئلة مفعّلة");
 
             var snapshots = await LoadQuestionSnapshotsAsync(
-                questions.Select(q => q.QuestionId).ToList(), cancellationToken);
+                rows.Select(r => r.QuestionId).ToList(), cancellationToken);
 
             return await PersistAttemptAsync(
-                quizId, userId, previousAttemptId: null, questions, snapshots, cancellationToken);
+                quizId, userId, previousAttemptId: null, rows, snapshots, language, cancellationToken);
         }
 
         private async Task<QuizAttemptResponseDto> StartRetryAttemptAsync(
             int quizId,
             Guid userId,
             long previousAttemptId,
+            string language,
             CancellationToken cancellationToken)
         {
             var previousAttempt = await _db.QuizAttempts
@@ -104,6 +155,8 @@ namespace AssessmentBL.Services
                 throw new InvalidOperationException(
                     $"تمت إعادة المحاولة رقم {previousAttemptId} من قبل");
 
+            // Only auto-graded questions can produce a mistake, so a retry never
+            // contains an Essay by construction.
             var wrongQuestionIds = await _db.QuizAttemptMistakes
                 .AsNoTracking()
                 .Where(m => m.QuizAttemptId == previousAttemptId)
@@ -114,28 +167,102 @@ namespace AssessmentBL.Services
                 throw new InvalidOperationException(
                     $"المحاولة رقم {previousAttemptId} لا تحتوي على إجابات خاطئة لإعادتها");
 
-            var questions = await ProjectQuestions(
-                    _db.Questions.AsNoTracking().Where(q => wrongQuestionIds.Contains(q.Id)))
+            // A question an admin has deactivated since (typically because it was
+            // wrong) is not served again.
+            var rows = await LocalizedQuestionQuery.Project(
+                    _db.Questions.AsNoTracking().Where(q => wrongQuestionIds.Contains(q.Id) && q.IsActive), language)
                 .ToListAsync(cancellationToken);
 
-            var latestHints = await GetLatestHintPerQuestionAsync(previousAttemptId, cancellationToken);
+            if (rows.Count == 0)
+                throw new InvalidOperationException(
+                    $"أسئلة المحاولة رقم {previousAttemptId} الخاطئة لم تعد متاحة لإعادتها");
 
-            foreach (var question in questions)
+            var latestHints = await GetLatestHintPerQuestionAsync(previousAttemptId, language, cancellationToken);
+
+            foreach (var row in rows)
             {
-                if (latestHints.TryGetValue(question.QuestionId, out var hintText))
-                    question.CurrentHint = hintText;
+                if (latestHints.TryGetValue(row.QuestionId, out var hintText))
+                    row.CurrentHint = hintText;
             }
 
-            var snapshots = await LoadQuestionSnapshotsAsync(wrongQuestionIds, cancellationToken);
+            var snapshots = await LoadQuestionSnapshotsAsync(
+                rows.Select(r => r.QuestionId).ToList(), cancellationToken);
 
             return await PersistAttemptAsync(
-                quizId, userId, previousAttemptId, questions, snapshots, cancellationToken);
+                quizId, userId, previousAttemptId, rows, snapshots, language, cancellationToken);
+        }
+
+        /// <summary>
+        /// The placement test. Refuses a learner who is already placed, resumes an
+        /// open placement attempt (the app was closed mid-test), and otherwise
+        /// serves the level-by-level sample chosen by <see cref="PlacementEngine"/>.
+        /// </summary>
+        private async Task<QuizAttemptResponseDto> StartPlacementAttemptAsync(
+            int quizId,
+            Guid userId,
+            string language,
+            CancellationToken cancellationToken)
+        {
+            if (await _db.UserPlacements.AsNoTracking().AnyAsync(p => p.UserId == userId, cancellationToken))
+                throw new ConflictException(AlreadyPlacedMessage);
+
+            var openAttemptId = await _placement.FindResumableAttemptIdAsync(userId, quizId, cancellationToken);
+
+            if (openAttemptId is long attemptId)
+                return await GetByIdAsync(attemptId, userId, language, cancellationToken);
+
+            var questionIds = await _placement.SelectQuestionIdsAsync(cancellationToken);
+
+            if (questionIds.Count == 0)
+                throw new InvalidOperationException(
+                    "اختبار تحديد المستوى غير متاح حاليًا: لا توجد أسئلة تقييم مفعّلة للمستويات");
+
+            var rows = await LoadRowsInOrderAsync(questionIds, language, cancellationToken);
+            NumberInAttemptOrder(rows);
+
+            var snapshots = await LoadQuestionSnapshotsAsync(questionIds, cancellationToken);
+
+            return await PersistAttemptAsync(
+                quizId, userId, previousAttemptId: null, rows, snapshots, language, cancellationToken);
+        }
+
+        /// <summary>
+        /// Loads the localized rows for <paramref name="orderedQuestionIds"/> and
+        /// returns them in that order, not in DisplayOrder.
+        /// </summary>
+        private async Task<List<LocalizedQuestionRow>> LoadRowsInOrderAsync(
+            List<int> orderedQuestionIds,
+            string language,
+            CancellationToken cancellationToken)
+        {
+            var rowsById = (await LocalizedQuestionQuery.Project(
+                        _db.Questions.AsNoTracking().Where(q => orderedQuestionIds.Contains(q.Id)), language)
+                    .ToListAsync(cancellationToken))
+                .ToDictionary(r => r.QuestionId);
+
+            return orderedQuestionIds
+                .Where(rowsById.ContainsKey)
+                .Select(id => rowsById[id])
+                .ToList();
+        }
+
+        /// <summary>
+        /// Placement questions come from several quizzes whose DisplayOrder values
+        /// overlap (each level's quiz starts at 1), so the attempt's own order —
+        /// easiest level first — is published as 1..n instead.
+        /// </summary>
+        private static void NumberInAttemptOrder(IReadOnlyList<LocalizedQuestionRow> rows)
+        {
+            for (var i = 0; i < rows.Count; i++)
+                rows[i].DisplayOrder = (short)(i + 1);
         }
 
         /// <summary>
         /// Reads the question fields that must be frozen for the lifetime of an
-        /// attempt: its classification (TopicId/Difficulty) and its answer key.
-        /// Everything else stays referenced from the live Question row.
+        /// attempt: its classification, its type, and its answer key. An Essay has
+        /// no key, so CorrectOptionId is null for it — the live
+        /// CK_QuizAttemptQuestions_EssayHasNoKey requires exactly that: NULL for
+        /// Essay and NOT NULL for every other type.
         /// </summary>
         private async Task<Dictionary<int, QuestionSnapshot>> LoadQuestionSnapshotsAsync(
             IReadOnlyCollection<int> questionIds,
@@ -149,6 +276,7 @@ namespace AssessmentBL.Services
                     q.Id,
                     q.TopicId,
                     q.Difficulty,
+                    q.QuestionType,
                     CorrectOptionId = q.QuestionOptions
                         .Where(o => o.IsCorrect)
                         .Select(o => (int?)o.Id)
@@ -156,7 +284,10 @@ namespace AssessmentBL.Services
                 })
                 .ToListAsync(cancellationToken);
 
-            var unanswerable = rows.Where(r => r.CorrectOptionId is null).Select(r => r.Id).ToList();
+            var unanswerable = rows
+                .Where(r => r.CorrectOptionId is null && QuestionTypes.IsAutoGraded(r.QuestionType))
+                .Select(r => r.Id)
+                .ToList();
 
             if (unanswerable.Count > 0)
                 throw new InvalidOperationException(
@@ -164,17 +295,23 @@ namespace AssessmentBL.Services
 
             return rows.ToDictionary(
                 r => r.Id,
-                r => new QuestionSnapshot(r.TopicId, r.Difficulty, r.CorrectOptionId!.Value));
+                r => new QuestionSnapshot(
+                    r.TopicId,
+                    r.Difficulty,
+                    r.QuestionType,
+                    QuestionTypes.IsAutoGraded(r.QuestionType) ? r.CorrectOptionId : null));
         }
 
-        private sealed record QuestionSnapshot(int TopicId, string Difficulty, int CorrectOptionId);
+        private sealed record QuestionSnapshot(
+            int TopicId, string Difficulty, string QuestionType, int? CorrectOptionId);
 
         private async Task<QuizAttemptResponseDto> PersistAttemptAsync(
             int quizId,
             Guid userId,
             long? previousAttemptId,
-            IReadOnlyList<QuizQuestionForAttemptDto> questions,
+            IReadOnlyList<LocalizedQuestionRow> rows,
             IReadOnlyDictionary<int, QuestionSnapshot> snapshots,
+            string language,
             CancellationToken cancellationToken)
         {
             var attempt = new QuizAttempt
@@ -182,7 +319,7 @@ namespace AssessmentBL.Services
                 QuizId = quizId,
                 UserId = userId,
                 PreviousAttemptId = previousAttemptId,
-                TotalQuestionsAtAttempt = (short)questions.Count,
+                TotalQuestionsAtAttempt = (short)rows.Count,
                 QuestionsAnsweredCount = 0,
                 CorrectAnswersCount = 0,
                 ScorePercentage = 0m,
@@ -190,24 +327,22 @@ namespace AssessmentBL.Services
                 StartedAt = _clock.UtcNow
             };
 
-            foreach (var question in questions)
+            foreach (var row in rows)
             {
-                var snapshot = snapshots[question.QuestionId];
+                var snapshot = snapshots[row.QuestionId];
 
                 attempt.QuizAttemptQuestions.Add(new QuizAttemptQuestion
                 {
-                    QuestionId = question.QuestionId,
+                    QuestionId = row.QuestionId,
                     TopicId = snapshot.TopicId,
                     Difficulty = snapshot.Difficulty,
+                    QuestionType = snapshot.QuestionType,
                     CorrectOptionId = snapshot.CorrectOptionId
                 });
             }
 
             _db.QuizAttempts.Add(attempt);
 
-            // The attempt and its snapshot rows go in one SaveChanges, so EF's
-            // implicit transaction already makes them atomic — no explicit
-            // transaction needed here.
             try
             {
                 await _db.SaveChangesAsync(cancellationToken);
@@ -215,9 +350,6 @@ namespace AssessmentBL.Services
             catch (DbUpdateException ex) when (previousAttemptId is not null
                                                && ex.IsUniqueViolationOf("UQ_QuizAttempts_PreviousAttemptId"))
             {
-                // The AnyAsync guard above is only a friendly pre-check; two
-                // concurrent retries can both pass it. UQ_QuizAttempts_PreviousAttemptId
-                // is the real protection and exactly one insert survives it.
                 throw new ConflictException(
                     $"تمت إعادة المحاولة رقم {previousAttemptId} بالفعل", ex);
             }
@@ -227,18 +359,98 @@ namespace AssessmentBL.Services
                 AttemptId = attempt.Id,
                 QuizId = attempt.QuizId,
                 StartedAt = attempt.StartedAt,
-                Questions = questions.ToList()
+                Language = language,
+                LanguageFallbackApplied = rows.Any(r => r.UsedFallback),
+                Questions = rows.Select(r => r.ToDto()).ToList()
             };
         }
 
+        /// <summary>
+        /// Submission is two phases with a hard boundary between them:
+        ///
+        ///   A. CRITICAL — validate (every question answered), grade, persist
+        ///      answers + score + statistics (+ the placement, for a placement
+        ///      test), COMMIT. No AI here.
+        ///   B. OPTIONAL — only after the commit, within one AI budget: hints for
+        ///      the wrong MCQ/TF answers, then AI evaluation of the essays. Nothing
+        ///      here can fail the request or touch the committed score.
+        ///
+        /// A repeated submit of an already-completed attempt replays the saved
+        /// result: no re-grading, no second statistics update, no second AI call.
+        /// </summary>
         public async Task<QuizAttemptResultDto> SubmitAsync(
             long attemptId,
             Guid userId,
             SubmitQuizAttemptDto dto,
+            string? language = null,
             CancellationToken cancellationToken = default)
         {
             ArgumentNullException.ThrowIfNull(dto);
 
+            var resolvedLanguage = ContentLanguages.Normalize(language);
+
+            // ── Phase A: critical ────────────────────────────────────────────
+            var graded = await GradeAndCommitAsync(attemptId, userId, dto, resolvedLanguage, cancellationToken);
+
+            // Already submitted — a double tap, a Flutter retry after a lost
+            // response, or the losing side of a concurrent submit.
+            if (graded is null)
+                return await GetResultAsync(attemptId, userId, resolvedLanguage, cancellationToken);
+
+            // ── Phase B: optional ────────────────────────────────────────────
+            // Phase A's entities are committed; nothing below may re-save them.
+            _db.ChangeTracker.Clear();
+
+            // One budget for all optional AI work: hints first (they feed the
+            // retry), then essays with whatever is left — essays not evaluated in
+            // time are picked up by the background evaluator. Deliberately NOT the
+            // request's token: if the child's connection drops right after the
+            // commit, the work still finishes and GET .../result shows it.
+            using var aiBudget = new CancellationTokenSource(_settings.AiHintTimeout);
+
+            // A placement test is never retried, so there is nothing to hint.
+            var retry = graded.Placement is null
+                ? await BuildRetryQuestionsWithHintsAsync(userId, graded, resolvedLanguage, aiBudget.Token)
+                : RetrySet.None();
+
+            if (graded.EssayCount > 0)
+                await TryEvaluateEssaysAsync(graded.AttemptId, aiBudget.Token);
+
+            var essayResults = await TryLoadEssayResultsAsync(graded.AttemptId);
+
+            return new QuizAttemptResultDto
+            {
+                AttemptId = graded.AttemptId,
+                QuizId = graded.QuizId,
+                CompletedAt = graded.CompletedAt,
+                TotalQuestions = graded.TotalQuestions,
+                AutoGradedQuestions = graded.AutoGradedQuestions,
+                PendingEssayQuestions = essayResults is null
+                    ? graded.EssayCount
+                    : (short)essayResults.Count(e => e.Status == EssayAnswerStatuses.Pending),
+                EssayResults = essayResults ?? [],
+                CorrectAnswers = graded.CorrectAnswers,
+                WrongAnswers = (short)graded.Mistakes.Count,
+                ScorePercentage = graded.ScorePercentage,
+                Language = resolvedLanguage,
+                LanguageFallbackApplied = retry.UsedFallback,
+                HintsStatus = retry.HintsStatus,
+                RetryQuestions = retry.Questions,
+                Placement = graded.Placement
+            };
+        }
+
+        /// <summary>
+        /// Phase A. Returns null when the attempt had already been submitted, so
+        /// the caller replays the saved result instead of grading twice.
+        /// </summary>
+        private async Task<GradedSubmission?> GradeAndCommitAsync(
+            long attemptId,
+            Guid userId,
+            SubmitQuizAttemptDto dto,
+            string language,
+            CancellationToken cancellationToken)
+        {
             var attempt = await _db.QuizAttempts
                 .FirstOrDefaultAsync(a => a.Id == attemptId, cancellationToken)
                 ?? throw new KeyNotFoundException($"المحاولة رقم {attemptId} غير موجودة");
@@ -246,23 +458,62 @@ namespace AssessmentBL.Services
             if (attempt.UserId != userId)
                 throw new UnauthorizedAccessException("لا يمكنك تسليم محاولة مستخدم آخر");
 
-            if (attempt.Status != QuizAttemptStatuses.InProgress)
-                throw new InvalidOperationException(
-                    $"المحاولة رقم {attemptId} تم تسليمها بالفعل");
+            if (attempt.Status == QuizAttemptStatuses.Completed)
+                return null;
 
-            // The attempt-start snapshot is the answer key. Grading never reads
-            // QuestionOption.IsCorrect, so an admin editing the correct answer
-            // after this attempt started cannot change how it is scored.
+            if (attempt.Status == QuizAttemptStatuses.Abandoned)
+                throw AttemptAbandoned(attemptId);
+
+            if (IsExpired(attempt.StartedAt))
+            {
+                // The same rule the sweep applies, applied now, so the outcome
+                // never depends on when the sweep last ran.
+                await MarkAbandonedAsync(attemptId, cancellationToken);
+                throw AttemptAbandoned(attemptId);
+            }
+
+            var quizType = await _db.Quizzes
+                .AsNoTracking()
+                .Where(q => q.Id == attempt.QuizId)
+                .Select(q => q.QuizType)
+                .FirstAsync(cancellationToken);
+
+            var isPlacement = quizType == QuizTypes.Placement;
+
+            if (isPlacement
+                && await _db.UserPlacements.AsNoTracking().AnyAsync(p => p.UserId == userId, cancellationToken))
+                throw new ConflictException(AlreadyPlacedMessage);
+
+            // The attempt-start snapshot is the answer key AND the type authority.
             var attemptQuestions = await _db.QuizAttemptQuestions
                 .AsNoTracking()
                 .Where(aq => aq.QuizAttemptId == attemptId)
-                .Select(aq => new { aq.QuestionId, aq.CorrectOptionId })
+                .Select(aq => new { aq.QuestionId, aq.CorrectOptionId, aq.QuestionType, aq.Question.Points })
                 .ToListAsync(cancellationToken);
 
-            var correctOptionByQuestion = attemptQuestions.ToDictionary(aq => aq.QuestionId, aq => aq.CorrectOptionId);
-            var submittedMistakes = ValidateSubmittedMistakes(dto, correctOptionByQuestion.Keys.ToHashSet());
+            var autoGradedByQuestion = attemptQuestions
+                .Where(aq => QuestionTypes.IsAutoGraded(aq.QuestionType))
+                .ToDictionary(aq => aq.QuestionId, aq => aq.CorrectOptionId!.Value);
 
-            var selectedOptionIds = submittedMistakes.Select(m => m.SelectedOptionId).ToList();
+            var essayQuestionIds = attemptQuestions
+                .Where(aq => !QuestionTypes.IsAutoGraded(aq.QuestionType))
+                .Select(aq => aq.QuestionId)
+                .ToHashSet();
+
+            // An essay's maximum is fixed when it is submitted, so a later change to
+            // the question's Points cannot put a grade above the maximum shown.
+            var essayMaxPoints = attemptQuestions
+                .Where(aq => !QuestionTypes.IsAutoGraded(aq.QuestionType))
+                .ToDictionary(aq => aq.QuestionId, aq => aq.Points);
+
+            var submittedAnswers = ValidateSubmittedAnswers(dto, autoGradedByQuestion.Keys.ToHashSet());
+            var submittedEssays = ValidateSubmittedEssays(dto, essayQuestionIds, _settings.EffectiveEssayAnswerMaxLength);
+
+            EnsureEveryQuestionAnswered(
+                attemptQuestions.Select(aq => aq.QuestionId),
+                submittedAnswers.Select(a => a.QuestionId).Concat(submittedEssays.Select(e => e.QuestionId)).ToHashSet());
+
+            var selectedOptionIds = submittedAnswers.Select(m => m.SelectedOptionId).ToList();
 
             var selectedOptions = await _db.QuestionOptions
                 .AsNoTracking()
@@ -271,242 +522,870 @@ namespace AssessmentBL.Services
                 .ToListAsync(cancellationToken);
 
             var optionsById = selectedOptions.ToDictionary(o => o.Id);
-            var confirmedMistakes = new List<QuizAttemptMistakeDto>(submittedMistakes.Count);
+            var confirmedMistakes = new List<QuizAttemptMistakeDto>(submittedAnswers.Count);
 
-            foreach (var mistake in submittedMistakes)
+            foreach (var answer in submittedAnswers)
             {
-                if (!optionsById.TryGetValue(mistake.SelectedOptionId, out var option))
+                if (!optionsById.TryGetValue(answer.SelectedOptionId, out var option))
                     throw new ArgumentException(
-                        $"الاختيار رقم {mistake.SelectedOptionId} غير موجود", nameof(dto));
+                        $"الاختيار رقم {answer.SelectedOptionId} غير موجود", nameof(dto));
 
-                if (option.QuestionId != mistake.QuestionId)
+                if (option.QuestionId != answer.QuestionId)
                     throw new ArgumentException(
-                        $"الاختيار رقم {mistake.SelectedOptionId} لا يخص السؤال رقم {mistake.QuestionId}",
+                        $"الاختيار رقم {answer.SelectedOptionId} لا يخص السؤال رقم {answer.QuestionId}",
                         nameof(dto));
 
-                if (mistake.SelectedOptionId != correctOptionByQuestion[mistake.QuestionId])
-                    confirmedMistakes.Add(mistake);
+                if (answer.SelectedOptionId != autoGradedByQuestion[answer.QuestionId])
+                    confirmedMistakes.Add(answer);
             }
 
-            var totalQuestions = attempt.TotalQuestionsAtAttempt;
-            var correctAnswers = (short)(totalQuestions - confirmedMistakes.Count);
+            var autoGradedCount = (short)autoGradedByQuestion.Count;
+            var correctAnswers = (short)(autoGradedCount - confirmedMistakes.Count);
 
-            var hints = await GenerateHintsAsync(userId, confirmedMistakes, cancellationToken);
+            // Decided BEFORE the transaction: it reads the Content module's levels
+            // through another DbContext, which must not sit inside our transaction.
+            PlacementDecision? placement = null;
 
-            await using var transaction = await _db.Database.BeginTransactionAsync(cancellationToken);
+            if (isPlacement)
+                placement = await _placement.EvaluateAsync(
+                    autoGradedByQuestion.Keys.ToList(),
+                    confirmedMistakes.Select(m => m.QuestionId).ToHashSet(),
+                    _settings.EffectivePlacementPassPercentage,
+                    cancellationToken);
 
-            var recordedMistakes = new List<QuizAttemptMistake>(confirmedMistakes.Count);
-
-            foreach (var mistake in confirmedMistakes)
+            try
             {
-                var recorded = new QuizAttemptMistake
-                {
-                    QuizAttemptId = attemptId,
-                    QuestionId = mistake.QuestionId,
-                    SelectedOptionId = mistake.SelectedOptionId
-                };
+                return await CommitSubmissionAsync(
+                    attempt, confirmedMistakes, submittedEssays, autoGradedCount, correctAnswers, placement, language,
+                    essayMaxPoints);
+            }
+            catch (DbUpdateException ex) when (ex.IsUniqueViolationOf("UQ_UserTopicStats_UserId_TopicId_Difficulty"))
+            {
+                // Two different attempts by the same child created the same
+                // statistics row at the same instant. Nothing was saved and the
+                // attempt is still InProgress, so a retry succeeds.
+                _db.ChangeTracker.Clear();
 
-                _db.QuizAttemptMistakes.Add(recorded);
-                recordedMistakes.Add(recorded);
+                throw new ConflictException(
+                    $"تعذّر تسليم المحاولة رقم {attemptId} بسبب طلب متزامن، برجاء إعادة المحاولة", ex);
+            }
+            catch (Exception ex) when (IsLostSubmissionRace(ex))
+            {
+                // Something else interfered: a concurrent submit of this attempt
+                // (RowVersion / unique answer or placement rows / a deadlock), the
+                // abandoned-attempt sweep (RowVersion), another attempt updating the
+                // same statistics row (UserTopicStats.RowVersion), or another
+                // placement attempt of this learner. Our transaction is already
+                // rolled back, so look at what actually happened.
+                _db.ChangeTracker.Clear();
+
+                var status = await _db.QuizAttempts
+                    .AsNoTracking()
+                    .Where(a => a.Id == attemptId)
+                    .Select(a => a.Status)
+                    .FirstOrDefaultAsync(cancellationToken);
+
+                if (status == QuizAttemptStatuses.Completed)
+                    return null;
+
+                if (status == QuizAttemptStatuses.Abandoned)
+                    throw AttemptAbandoned(attemptId);
+
+                if (ex is DbUpdateException placementClash
+                    && placementClash.IsUniqueViolationOf("UQ_UserPlacements_UserId"))
+                    throw new ConflictException(AlreadyPlacedMessage, ex);
+
+                throw new ConflictException(
+                    $"تعذّر تسليم المحاولة رقم {attemptId} بسبب طلب متزامن، برجاء إعادة المحاولة", ex);
+            }
+        }
+
+        /// <summary>
+        /// The one transaction of a submission. Runs with CancellationToken.None on
+        /// purpose: once grading has started writing, a dropped connection must not
+        /// cancel it half-way — the child's result is saved, and Flutter recovers it
+        /// with GET /api/quiz-attempts/{id}/result.
+        /// </summary>
+        private async Task<GradedSubmission> CommitSubmissionAsync(
+            QuizAttempt attempt,
+            IReadOnlyList<QuizAttemptMistakeDto> confirmedMistakes,
+            IReadOnlyList<QuizAttemptEssayAnswerDto> essays,
+            short autoGradedCount,
+            short correctAnswers,
+            PlacementDecision? placement,
+            string language,
+            IReadOnlyDictionary<int, byte> essayMaxPoints)
+        {
+            await using var transaction = await _db.Database.BeginTransactionAsync(CancellationToken.None);
+
+            var recordedMistakes = confirmedMistakes
+                .Select(m => new QuizAttemptMistake
+                {
+                    QuizAttemptId = attempt.Id,
+                    QuestionId = m.QuestionId,
+                    SelectedOptionId = m.SelectedOptionId
+                })
+                .ToList();
+
+            _db.QuizAttemptMistakes.AddRange(recordedMistakes);
+
+            // Essay answers are stored Pending and never enter ScorePercentage. The
+            // AI evaluates them after the commit; the language is kept so feedback
+            // comes back in it even when the background evaluator does the work.
+            foreach (var essay in essays)
+            {
+                _db.QuizAttemptEssayAnswers.Add(new QuizAttemptEssayAnswer
+                {
+                    QuizAttemptId = attempt.Id,
+                    QuestionId = essay.QuestionId,
+                    AnswerText = essay.AnswerText.Trim(),
+                    Status = EssayAnswerStatuses.Pending,
+                    LanguageCode = language,
+                    MaxPoints = essayMaxPoints[essay.QuestionId]
+                });
             }
 
-            attempt.QuestionsAnsweredCount = totalQuestions;
+            // InProgress → Completed. RowVersion makes this UPDATE affect 0 rows if
+            // anything changed the attempt since it was read, so this transition
+            // can happen exactly once.
+            attempt.QuestionsAnsweredCount = attempt.TotalQuestionsAtAttempt;
             attempt.CorrectAnswersCount = correctAnswers;
-            attempt.ScorePercentage = CalculateScorePercentage(correctAnswers, totalQuestions);
+            attempt.ScorePercentage = CalculateScorePercentage(correctAnswers, autoGradedCount);
             attempt.Status = QuizAttemptStatuses.Completed;
             attempt.CompletedAt = _clock.UtcNow;
 
-            // QuizAttempts.RowVersion is a concurrency token, so EF appends it
-            // to this UPDATE's WHERE clause. Of two concurrent submits exactly
-            // one matches; the loser affects 0 rows, throws, and its whole
-            // transaction — mistakes, hints and stats included — rolls back.
+            // The placement is as critical as the score: same transaction.
+            if (placement is not null)
+            {
+                _db.UserPlacements.Add(new UserPlacement
+                {
+                    UserId = attempt.UserId,
+                    QuizAttemptId = attempt.Id,
+                    PlacedLevelId = placement.PlacedLevel.Id,
+                    ScorePercentage = attempt.ScorePercentage,
+                    PassPercentage = (byte)placement.PassPercentage,
+                    PlacedAt = attempt.CompletedAt.Value
+                });
+            }
+
+            await _db.SaveChangesAsync(CancellationToken.None);
+
+            await _userTopicStatService.UpdateAfterQuizAttemptAsync(attempt.Id, attempt.UserId, CancellationToken.None);
+
+            await transaction.CommitAsync(CancellationToken.None);
+
+            return new GradedSubmission(
+                attempt.Id,
+                attempt.QuizId,
+                attempt.CompletedAt.Value,
+                attempt.TotalQuestionsAtAttempt,
+                autoGradedCount,
+                (short)essays.Count,
+                correctAnswers,
+                attempt.ScorePercentage,
+                recordedMistakes
+                    .Select(m => new RecordedMistake(m.Id, m.QuestionId, m.SelectedOptionId))
+                    .ToList(),
+                placement is null
+                    ? null
+                    : PlacementEngine.ToResultDto(
+                        placement, placement.PlacedLevel.Id, attempt.ScorePercentage, attempt.CompletedAt.Value));
+        }
+
+        /// <summary>
+        /// Every way a concurrent request can make this submission lose: RowVersion
+        /// (another submit or the sweep changed the attempt, or another attempt
+        /// changed a shared statistics row), a unique answer or placement row the
+        /// other request inserted first, or a deadlock victim (the server rolled
+        /// us back). The caller re-reads the attempt to decide the answer.
+        /// </summary>
+        private static bool IsLostSubmissionRace(Exception exception) =>
+            exception is DbUpdateConcurrencyException
+            || exception.IsDeadlockVictim()
+            || (exception is DbUpdateException update
+                && (update.IsUniqueViolationOf("UQ_QuizAttemptMistakes_AttemptId_QuestionId")
+                 || update.IsUniqueViolationOf("UQ_QuizAttemptEssayAnswers_AttemptId_QuestionId")
+                 || update.IsUniqueViolationOf("UQ_UserPlacements_UserId")
+                 || update.IsUniqueViolationOf("UQ_UserPlacements_QuizAttemptId")));
+
+        /// <summary>
+        /// Phase B, hints. Never throws. The result is already committed; every
+        /// failure here — the AI, or even the database — degrades to "no hints",
+        /// never to a failed submission. The AI call is bounded by the caller's
+        /// <paramref name="aiToken"/> budget.
+        /// </summary>
+        private async Task<RetrySet> BuildRetryQuestionsWithHintsAsync(
+            Guid userId,
+            GradedSubmission graded,
+            string language,
+            CancellationToken aiToken)
+        {
+            if (graded.Mistakes.Count == 0)
+                return RetrySet.None();
+
+            List<LocalizedQuestionRow> rows;
+
             try
             {
-                await _db.SaveChangesAsync(cancellationToken);
+                var questionIds = graded.Mistakes.Select(m => m.QuestionId).ToList();
+
+                rows = await LocalizedQuestionQuery.Project(
+                        _db.Questions.AsNoTracking().Where(q => questionIds.Contains(q.Id)), language)
+                    .ToListAsync(CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Attempt {AttemptId} was saved, but its retry questions could not be loaded. "
+                  + "The result is returned without them; the result endpoint can recover them.",
+                    graded.AttemptId);
+
+                return new RetrySet([], false, HintStatuses.Unavailable);
+            }
+
+            var hints = await TryGenerateHintsAsync(userId, graded, rows, language, aiToken);
+
+            if (hints.Count > 0)
+                await TryPersistHintsAsync(userId, graded, hints, language);
+
+            return new RetrySet(
+                BuildRetryQuestions(rows, hints),
+                rows.Any(r => r.UsedFallback),
+                HintStatuses.Resolve(graded.Mistakes.Count, hints.Count));
+        }
+
+        private async Task<IReadOnlyDictionary<int, string>> TryGenerateHintsAsync(
+            Guid userId,
+            GradedSubmission graded,
+            IReadOnlyList<LocalizedQuestionRow> rows,
+            string language,
+            CancellationToken aiToken)
+        {
+            // Not configured is the normal state until an AI service exists — not
+            // worth a warning with a stack trace on every submission.
+            if (!_aiHintGenerator.IsConfigured)
+                return NoHints;
+
+            try
+            {
+                return await GenerateHintsAsync(userId, graded, rows, language, aiToken);
+            }
+            catch (OperationCanceledException ex) when (aiToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(ex,
+                    "AI hint generation for attempt {AttemptId} exceeded {TimeoutSeconds}s. "
+                  + "The saved result is returned without hints.",
+                    graded.AttemptId, _settings.AiHintTimeout.TotalSeconds);
+            }
+            catch (Exception ex)
+            {
+                // Provider down or unreachable, HTTP error, malformed payload —
+                // hints are optional, so all of them end here.
+                _logger.LogWarning(ex,
+                    "AI hint generation for attempt {AttemptId} failed. The saved result is returned without hints.",
+                    graded.AttemptId);
+            }
+
+            return NoHints;
+        }
+
+        private async Task TryPersistHintsAsync(
+            Guid userId,
+            GradedSubmission graded,
+            IReadOnlyDictionary<int, string> hints,
+            string language)
+        {
+            try
+            {
+                await PersistHintsAsync(graded.AttemptId, graded.Mistakes, hints, language, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                // Hints that failed to save are still returned in this response.
+                _db.ChangeTracker.Clear();
+                _logger.LogError(ex, "Hints for attempt {AttemptId} were generated but could not be saved.", graded.AttemptId);
+                return;
+            }
+
+            try
+            {
+                // Hints are saved after the statistics were committed, so re-derive
+                // HintsUsedCount for this attempt's buckets. It is recomputed from
+                // saved hints, never accumulated, so a miss self-heals next time.
+                await _userTopicStatService.RefreshHintsUsedCountAsync(graded.AttemptId, userId, CancellationToken.None);
             }
             catch (DbUpdateConcurrencyException ex)
             {
-                throw new ConflictException(
-                    $"المحاولة رقم {attemptId} تم تسليمها بالفعل", ex);
+                _db.ChangeTracker.Clear();
+                _logger.LogWarning(ex,
+                    "HintsUsedCount for attempt {AttemptId} was not refreshed: another submission updated the same "
+                  + "statistics at the same time. The hints are saved; the count is recomputed on the next submission.",
+                    graded.AttemptId);
             }
-            catch (DbUpdateException ex) when (
-                ex.IsUniqueViolationOf("UQ_QuizAttemptMistakes_AttemptId_QuestionId"))
+            catch (Exception ex)
             {
-                throw new ConflictException(
-                    $"المحاولة رقم {attemptId} تم تسليمها بالفعل", ex);
+                _db.ChangeTracker.Clear();
+                _logger.LogError(ex,
+                    "HintsUsedCount for attempt {AttemptId} could not be refreshed. The hints are saved.", graded.AttemptId);
             }
-
-            await PersistHintsAsync(recordedMistakes, hints.HintTextByQuestion, cancellationToken);
-
-            await _userTopicStatService.UpdateAfterQuizAttemptAsync(attemptId, userId, cancellationToken);
-
-            await transaction.CommitAsync(cancellationToken);
-
-            return new QuizAttemptResultDto
-            {
-                AttemptId = attempt.Id,
-                TotalQuestions = totalQuestions,
-                CorrectAnswers = correctAnswers,
-                WrongAnswers = (short)(totalQuestions - correctAnswers),
-                ScorePercentage = attempt.ScorePercentage,
-                RetryQuestions = hints.RetryQuestions
-            };
         }
 
-        private async Task<GeneratedHints> GenerateHintsAsync(
+        /// <summary>
+        /// Builds the v1 hint request (docs/AI_CONTRACT.md): for each wrong answer,
+        /// the question, its type, every option, the child's choice and the correct
+        /// option from the frozen answer key — never per-option isCorrect flags,
+        /// never a user or attempt id. Then keeps only hints that are well-formed,
+        /// short enough, and do not name the correct answer.
+        /// </summary>
+        private async Task<IReadOnlyDictionary<int, string>> GenerateHintsAsync(
             Guid userId,
-            IReadOnlyList<QuizAttemptMistakeDto> mistakes,
+            GradedSubmission graded,
+            IReadOnlyList<LocalizedQuestionRow> rows,
+            string language,
             CancellationToken cancellationToken)
         {
-            if (mistakes.Count == 0)
-                return GeneratedHints.None;
-
+            var mistakes = graded.Mistakes;
             var questionIds = mistakes.Select(m => m.QuestionId).ToList();
-            var selectedOptionIds = mistakes.Select(m => m.SelectedOptionId).ToList();
-            var questions = await _db.Questions
-                .AsNoTracking()
-                .Where(q => questionIds.Contains(q.Id))
-                .Select(q => new
-                {
-                    q.Id,
-                    q.QuestionText,
-                    q.Difficulty,
-                    q.DisplayOrder,
-                    q.Points,
-                    Options = q.QuestionOptions
-                        .OrderBy(o => o.DisplayOrder)
-                        .Select(o => new QuizAnswerOptionDto
-                        {
-                            OptionId = o.Id,
-                            OptionText = o.OptionText,
-                            DisplayOrder = o.DisplayOrder
-                        })
-                        .ToList()
-                })
-                .ToListAsync(cancellationToken);
 
-            var options = await _db.QuestionOptions
+            // The key and type this attempt was graded against, even if an admin has
+            // edited the question since.
+            var answerKeys = await _db.QuizAttemptQuestions
                 .AsNoTracking()
-                .Where(o => selectedOptionIds.Contains(o.Id))
-                .Select(o => new { o.Id, o.OptionText })
-                .ToDictionaryAsync(o => o.Id, cancellationToken);
+                .Where(aq => aq.QuizAttemptId == graded.AttemptId && questionIds.Contains(aq.QuestionId))
+                .Select(aq => new { aq.QuestionId, aq.CorrectOptionId, aq.QuestionType, aq.Difficulty })
+                .ToDictionaryAsync(aq => aq.QuestionId, cancellationToken);
 
+            var topics = await _aiRequests.LoadTopicNamesAsync(questionIds, language, cancellationToken);
+
+            // Age only, and only when it is known — so a hint can be pitched at the
+            // child's level. Nothing else about the learner is ever sent.
+            var age = await _learners.GetAgeAsync(userId, cancellationToken);
+
+            // Previous hints in the SAME language — an Arabic hint is not context
+            // for an English one.
+            // Through the hint's own (attempt, question) link: a Hint-button hint
+            // has no mistake row, and going through the mistake would skip it.
             var previousHints = await _db.QuestionHints
                 .AsNoTracking()
-                .Where(h => questionIds.Contains(h.QuizAttemptMistake.QuestionId)
-                         && h.QuizAttemptMistake.QuizAttempt.UserId == userId)
-                .OrderBy(h => h.QuizAttemptMistake.QuizAttemptId)
+                .Where(h => questionIds.Contains(h.QuestionId)
+                         && h.QuizAttemptQuestion.QuizAttempt.UserId == userId
+                         && h.LanguageCode == language)
+                .OrderBy(h => h.QuizAttemptId)
                 .ThenBy(h => h.HintSequence)
-                .Select(h => new { h.QuizAttemptMistake.QuestionId, h.HintText })
+                .Select(h => new { h.QuestionId, h.HintText })
                 .ToListAsync(cancellationToken);
 
             var hintsByQuestion = previousHints
                 .GroupBy(h => h.QuestionId)
                 .ToDictionary(g => g.Key, g => (IReadOnlyList<string>)g.Select(h => h.HintText).ToList());
-            var questionsById = questions.ToDictionary(q => q.Id);
 
-            var request = new GenerateHintsRequest
+            var rowsById = rows.ToDictionary(r => r.QuestionId);
+            var items = new List<HintRequestItem>(mistakes.Count);
+            var imageBudget = _aiRequests.NewImageBudget();
+
+            // What the child sees as the correct option, whether it is a TrueFalse,
+            // and (for TrueFalse) the other option — for the leak check on the way back.
+            var correctAnswerByQuestion = new Dictionary<int, (string? Text, bool IsBinary, string? Other)>(mistakes.Count);
+
+            foreach (var m in mistakes)
             {
-                Questions = mistakes.Select(m => new GenerateHintQuestion
+                if (!rowsById.TryGetValue(m.QuestionId, out var row)
+                    || !answerKeys.TryGetValue(m.QuestionId, out var key)
+                    || key.CorrectOptionId is not int correctOptionId)
+                    continue;
+
+                var selected = row.Options.FirstOrDefault(o => o.OptionId == m.SelectedOptionId);
+                var correct = row.Options.FirstOrDefault(o => o.OptionId == correctOptionId);
+
+                if (selected is null || correct is null)
+                    continue;
+
+                // Never ask about something the AI cannot interpret: an image-only
+                // question or option without its description is excluded and
+                // reported rather than sent empty.
+                if (ResolveQuestionSemanticText(row.QuestionText, row.ImageDescription) is null)
+                {
+                    _logger.LogWarning(
+                        "Skipping hint generation for question {QuestionId}: it has neither text nor an ImageDescription.",
+                        m.QuestionId);
+                    continue;
+                }
+
+                if (ResolveOptionSemanticText(selected.OptionText, selected.ImageDescription) is null
+                    || ResolveOptionSemanticText(correct.OptionText, correct.ImageDescription) is null)
+                {
+                    _logger.LogWarning(
+                        "Skipping hint generation for question {QuestionId}: the selected or the correct option has no text "
+                      + "and no ImageDescription, so the AI cannot interpret it. An admin must supply ImageDescription.",
+                        m.QuestionId);
+                    continue;
+                }
+
+                var options = new List<AiOption>(row.Options.Count);
+
+                foreach (var option in row.Options)
+                    options.Add(new AiOption
+                    {
+                        OptionId = option.OptionId,
+                        Text = AiRequestBuilder.Clean(option.OptionText),
+                        Image = await _aiRequests.BuildImageAsync(
+                            option.ImageUrl, option.ImageDescription, imageBudget, cancellationToken)
+                    });
+
+                items.Add(new HintRequestItem
                 {
                     QuestionId = m.QuestionId,
-                    QuestionText = questionsById[m.QuestionId].QuestionText,
-                    WrongOptionText = options[m.SelectedOptionId].OptionText,
+                    QuestionType = key.QuestionType,
+                    Difficulty = key.Difficulty,
+                    Topic = topics.GetValueOrDefault(m.QuestionId),
+                    Question = new AiQuestion
+                    {
+                        Text = AiRequestBuilder.Clean(row.QuestionText),
+                        Image = await _aiRequests.BuildImageAsync(
+                            row.ImageUrl, row.ImageDescription, imageBudget, cancellationToken)
+                    },
+                    Options = options,
+                    StudentAnswer = new HintStudentAnswer { SelectedOptionId = m.SelectedOptionId },
+                    Reference = new HintReference { CorrectOptionId = correctOptionId },
                     PreviousHints = hintsByQuestion.TryGetValue(m.QuestionId, out var history)
                         ? history
                         : []
-                }).ToList()
-            };
+                });
 
-            var response = await _aiHintGenerator.GenerateHintsAsync(request, cancellationToken);
-            var expectedIds = questionIds.ToHashSet();
-            var generatedByQuestion = response.Hints
-                .Where(h => expectedIds.Contains(h.QuestionId))
-                .GroupBy(h => h.QuestionId)
-                .ToDictionary(g => g.Key, g => g.Single().HintText.Trim());
+                correctAnswerByQuestion[m.QuestionId] = (
+                    correct.OptionText,
+                    key.QuestionType == QuestionTypes.TrueFalse,
+                    row.Options.FirstOrDefault(o => o.OptionId != correctOptionId)?.OptionText);
+            }
 
-            if (generatedByQuestion.Count != expectedIds.Count
-                || generatedByQuestion.Values.Any(string.IsNullOrWhiteSpace))
-                throw new InvalidOperationException("The AI response did not contain one valid hint per wrong question");
+            if (items.Count == 0)
+                return NoHints;
 
-            var retryQuestions = questions
-                .OrderBy(q => q.DisplayOrder)
-                .Select(q => new QuizQuestionForAttemptDto
+            var response = await _aiHintGenerator.GenerateHintsAsync(
+                new GenerateHintsRequest
                 {
-                    QuestionId = q.Id,
-                    QuestionText = q.QuestionText,
-                    Difficulty = q.Difficulty,
-                    DisplayOrder = q.DisplayOrder,
-                    Points = q.Points,
-                    CurrentHint = generatedByQuestion[q.Id],
-                    Options = q.Options
+                    RequestId = Guid.NewGuid(),
+                    Language = language,
+                    LearnerContext = age is int years ? new LearnerContext { Age = years } : null,
+                    Items = items
+                },
+                cancellationToken);
+
+            // Only hints for questions that were actually ASKED, one each. A
+            // duplicate, a blank, an over-long hint, or one that names the correct
+            // answer is dropped — that question just has no hint.
+            var results = (response?.Results ?? Array.Empty<HintResult>())
+                .Where(r => r is not null && correctAnswerByQuestion.ContainsKey(r.QuestionId))
+                .GroupBy(r => r.QuestionId)
+                .Where(g => g.Count() == 1)
+                .Select(g => g.Single());
+
+            var accepted = new Dictionary<int, string>();
+
+            foreach (var result in results)
+            {
+                if (result.Status is not null
+                    && !string.Equals(result.Status, AiResultStatuses.Ok, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var hint = result.Hint?.Trim();
+
+                if (string.IsNullOrEmpty(hint))
+                    continue;
+
+                if (hint.Length > _settings.EffectiveMaxHintLength)
+                {
+                    _logger.LogWarning(
+                        "Dropped the AI hint for question {QuestionId}: {Length} characters exceeds the {Max} limit.",
+                        result.QuestionId, hint.Length, _settings.EffectiveMaxHintLength);
+                    continue;
+                }
+
+                var (correctText, isBinary, otherText) = correctAnswerByQuestion[result.QuestionId];
+
+                if (HintSafety.RevealsAnswer(hint, correctText, isBinary, otherText)
+                    || (!isBinary && HintSafety.IsTooSimilar(
+                        hint, correctText, _settings.EffectiveHintSimilarityThreshold)))
+                {
+                    _logger.LogWarning(
+                        "Dropped the AI hint for question {QuestionId}: it names the correct answer.", result.QuestionId);
+                    continue;
+                }
+
+                accepted[result.QuestionId] = hint;
+            }
+
+            if (accepted.Count < items.Count)
+                _logger.LogWarning(
+                    "The AI returned usable hints for {Accepted} of {Asked} wrong questions; "
+                  + "the rest are returned without a hint.",
+                    accepted.Count, items.Count);
+
+            return accepted;
+        }
+
+        /// <summary>
+        /// Phase B, essays. Never throws: out of budget, AI down or a database
+        /// hiccup all leave the essays Pending for the background evaluator.
+        /// </summary>
+        private async Task TryEvaluateEssaysAsync(long attemptId, CancellationToken aiToken)
+        {
+            // Hints used the whole budget: nothing to try, and nothing worth logging.
+            if (aiToken.IsCancellationRequested)
+                return;
+
+            try
+            {
+                await _essays.EvaluateAttemptAsync(attemptId, aiToken);
+            }
+            catch (Exception ex)
+            {
+                _db.ChangeTracker.Clear();
+                _logger.LogWarning(ex,
+                    "Inline essay evaluation for attempt {AttemptId} did not complete; the background evaluator will retry.",
+                    attemptId);
+            }
+        }
+
+        private async Task<List<EssayResultDto>?> TryLoadEssayResultsAsync(long attemptId)
+        {
+            try
+            {
+                return await LoadEssayResultsAsync(attemptId, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Attempt {AttemptId} was saved, but its essay results could not be loaded; the result endpoint can recover them.",
+                    attemptId);
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Only a grade the backend accepted is shown. An AI proposal waiting for
+        /// review, or an essay not evaluated yet, is just Pending.
+        /// </summary>
+        private Task<List<EssayResultDto>> LoadEssayResultsAsync(long attemptId, CancellationToken cancellationToken) =>
+            _db.QuizAttemptEssayAnswers
+                .AsNoTracking()
+                .Where(e => e.QuizAttemptId == attemptId)
+                .OrderBy(e => e.Question.DisplayOrder)
+                .Select(e => new EssayResultDto
+                {
+                    QuestionId = e.QuestionId,
+                    Status = e.Status == EssayAnswerStatuses.Graded
+                        ? EssayAnswerStatuses.Graded
+                        : EssayAnswerStatuses.Pending,
+                    AwardedPoints = e.Status == EssayAnswerStatuses.Graded ? e.AwardedPoints : null,
+                    MaxPoints = e.MaxPoints,
+                    Feedback = e.Status == EssayAnswerStatuses.Graded ? e.Feedback : null,
+                    GradedBy = e.Status == EssayAnswerStatuses.Graded ? e.GradedBy : null
+                })
+                .ToListAsync(cancellationToken);
+
+        /// <summary>
+        /// A question skipped for hint generation still belongs in the retry set —
+        /// it just carries no hint, so CurrentHint stays null.
+        /// </summary>
+        private static List<QuizQuestionForAttemptDto> BuildRetryQuestions(
+            IReadOnlyList<LocalizedQuestionRow> rows,
+            IReadOnlyDictionary<int, string> hintTextByQuestion) =>
+            rows
+                .OrderBy(r => r.DisplayOrder)
+                .Select(r =>
+                {
+                    var dto = r.ToDto();
+                    dto.CurrentHint = hintTextByQuestion.TryGetValue(r.QuestionId, out var hint)
+                        ? hint
+                        : null;
+                    return dto;
                 })
                 .ToList();
 
-            return new GeneratedHints(generatedByQuestion, retryQuestions);
-        }
+        /// <summary>See <see cref="AiRequestBuilder.QuestionSemanticText"/>.</summary>
+        private static string? ResolveQuestionSemanticText(string? questionText, string? imageDescription) =>
+            AiRequestBuilder.QuestionSemanticText(questionText, imageDescription);
 
+        /// <summary>See <see cref="AiRequestBuilder.OptionSemanticText"/>.</summary>
+        private static string? ResolveOptionSemanticText(string? optionText, string? imageDescription) =>
+            AiRequestBuilder.OptionSemanticText(optionText, imageDescription);
+
+        /// <summary>
+        /// Saves one hint per mistake that actually received one. A mistake the AI
+        /// skipped or answered badly simply gets no row.
+        /// </summary>
         private async Task PersistHintsAsync(
-            IReadOnlyList<QuizAttemptMistake> recordedMistakes,
+            long attemptId,
+            IReadOnlyList<RecordedMistake> mistakes,
             IReadOnlyDictionary<int, string> hintTextByQuestion,
+            string language,
             CancellationToken cancellationToken)
         {
-            if (recordedMistakes.Count == 0)
+            var hinted = mistakes
+                .Where(m => hintTextByQuestion.ContainsKey(m.QuestionId))
+                .ToList();
+
+            if (hinted.Count == 0)
                 return;
 
-            var mistakeIds = recordedMistakes.Select(m => m.Id).ToList();
-            var nextSequences = await _db.QuestionHints
-                .Where(h => mistakeIds.Contains(h.QuizAttemptMistakeId))
-                .GroupBy(h => h.QuizAttemptMistakeId)
-                .ToDictionaryAsync(g => g.Key, g => (byte)(g.Max(h => h.HintSequence) + 1), cancellationToken);
+            var questionIds = hinted.Select(m => m.QuestionId).ToList();
 
-            var persistedHints = recordedMistakes.Select(m => new QuestionHint
+            // Sequence numbering is per (attempt, question, language) — mirrors
+            // UQ_QuestionHints_AttemptId_QuestionId_Language_Sequence, and continues
+            // after any Hint-button hints the child already took on that question.
+            // Projected to (key, max) so the aggregate runs in SQL.
+            var nextSequences = await _db.QuestionHints
+                .AsNoTracking()
+                .Where(h => h.QuizAttemptId == attemptId
+                         && questionIds.Contains(h.QuestionId)
+                         && h.LanguageCode == language)
+                .GroupBy(h => h.QuestionId)
+                .Select(g => new { QuestionId = g.Key, Next = g.Max(h => h.HintSequence) + 1 })
+                .ToDictionaryAsync(x => x.QuestionId, x => (byte)x.Next, cancellationToken);
+
+            _db.QuestionHints.AddRange(hinted.Select(m => new QuestionHint
             {
+                QuizAttemptId = attemptId,
+                QuestionId = m.QuestionId,
                 QuizAttemptMistakeId = m.Id,
                 HintText = hintTextByQuestion[m.QuestionId],
-                HintSequence = nextSequences.TryGetValue(m.Id, out var sequence) ? sequence : (byte)1
-            }).ToList();
+                LanguageCode = language,
+                // Not an escalation level: this hint follows a submission.
+                AttemptNumber = null,
+                HintSequence = nextSequences.TryGetValue(m.QuestionId, out var sequence) ? sequence : (byte)1
+            }));
 
-            _db.QuestionHints.AddRange(persistedHints);
             await _db.SaveChangesAsync(cancellationToken);
         }
 
-        private sealed record GeneratedHints(
-            IReadOnlyDictionary<int, string> HintTextByQuestion,
-            List<QuizQuestionForAttemptDto> RetryQuestions)
+        /// <summary>
+        /// The saved result of a submitted attempt. Works whether or not the
+        /// original submit response ever reached the client, and is also what a
+        /// repeated submit replays. Essay grades that arrived later appear here.
+        /// </summary>
+        public async Task<QuizAttemptResultDto> GetResultAsync(
+            long attemptId,
+            Guid userId,
+            string? language = null,
+            CancellationToken cancellationToken = default)
         {
-            public static GeneratedHints None { get; } =
-                new(new Dictionary<int, string>(), []);
+            var resolvedLanguage = ContentLanguages.Normalize(language);
+
+            var attempt = await _db.QuizAttempts
+                .AsNoTracking()
+                .Where(a => a.Id == attemptId)
+                .Select(a => new
+                {
+                    a.Id,
+                    a.QuizId,
+                    a.UserId,
+                    a.Status,
+                    a.StartedAt,
+                    a.CompletedAt,
+                    a.TotalQuestionsAtAttempt,
+                    a.CorrectAnswersCount,
+                    a.ScorePercentage,
+                    a.Quiz.QuizType,
+                    AutoGradedQuestions = a.QuizAttemptQuestions.Count(aq => aq.QuestionType != QuestionTypes.Essay),
+                    PendingEssayQuestions = a.QuizAttemptEssayAnswers.Count(e => e.Status == EssayAnswerStatuses.Pending)
+                })
+                .FirstOrDefaultAsync(cancellationToken)
+                ?? throw new KeyNotFoundException($"المحاولة رقم {attemptId} غير موجودة");
+
+            // Ownership comes from the token's sub claim, never from the request.
+            if (attempt.UserId != userId)
+                throw new UnauthorizedAccessException("لا يمكنك الوصول إلى نتيجة محاولة مستخدم آخر");
+
+            if (attempt.Status == QuizAttemptStatuses.Abandoned
+                || (attempt.Status == QuizAttemptStatuses.InProgress && IsExpired(attempt.StartedAt)))
+                throw AttemptAbandoned(attemptId);
+
+            if (attempt.Status != QuizAttemptStatuses.Completed)
+                throw new ConflictException(
+                    $"المحاولة رقم {attemptId} لم يتم تسليمها بعد، برجاء إرسال الإجابات");
+
+            var wrongQuestionIds = await _db.QuizAttemptMistakes
+                .AsNoTracking()
+                .Where(m => m.QuizAttemptId == attemptId)
+                .Select(m => m.QuestionId)
+                .ToListAsync(cancellationToken);
+
+            PlacementResultDto? placement = null;
+            RetrySet retry;
+
+            if (attempt.QuizType == QuizTypes.Placement)
+            {
+                placement = await LoadPlacementResultAsync(attemptId, cancellationToken);
+                retry = RetrySet.None();
+            }
+            else
+            {
+                retry = await LoadSavedRetryQuestionsAsync(attemptId, wrongQuestionIds, resolvedLanguage, cancellationToken);
+            }
+
+            return new QuizAttemptResultDto
+            {
+                AttemptId = attempt.Id,
+                QuizId = attempt.QuizId,
+                CompletedAt = attempt.CompletedAt,
+                TotalQuestions = attempt.TotalQuestionsAtAttempt,
+                AutoGradedQuestions = (short)attempt.AutoGradedQuestions,
+                PendingEssayQuestions = (short)attempt.PendingEssayQuestions,
+                EssayResults = await LoadEssayResultsAsync(attemptId, cancellationToken),
+                CorrectAnswers = attempt.CorrectAnswersCount,
+                // Not the persisted WrongAnswersCount: that computed column is
+                // answered − correct, and "answered" includes essays.
+                WrongAnswers = (short)wrongQuestionIds.Count,
+                ScorePercentage = attempt.ScorePercentage,
+                Language = resolvedLanguage,
+                LanguageFallbackApplied = retry.UsedFallback,
+                HintsStatus = retry.HintsStatus,
+                RetryQuestions = retry.Questions,
+                Placement = placement
+            };
         }
+
+        private async Task<PlacementResultDto?> LoadPlacementResultAsync(
+            long attemptId,
+            CancellationToken cancellationToken)
+        {
+            var stored = await _db.UserPlacements
+                .AsNoTracking()
+                .Where(p => p.QuizAttemptId == attemptId)
+                .Select(p => new { p.PlacedLevelId, p.ScorePercentage, p.PassPercentage, p.PlacedAt })
+                .FirstOrDefaultAsync(cancellationToken);
+
+            return stored is null
+                ? null
+                : await _placement.DescribeAsync(
+                    attemptId,
+                    stored.PlacedLevelId,
+                    stored.ScorePercentage,
+                    stored.PassPercentage,
+                    stored.PlacedAt,
+                    cancellationToken);
+        }
+
+        private async Task<RetrySet> LoadSavedRetryQuestionsAsync(
+            long attemptId,
+            List<int> wrongQuestionIds,
+            string language,
+            CancellationToken cancellationToken)
+        {
+            if (wrongQuestionIds.Count == 0)
+                return RetrySet.None();
+
+            var rows = await LocalizedQuestionQuery.Project(
+                    _db.Questions.AsNoTracking().Where(q => wrongQuestionIds.Contains(q.Id)), language)
+                .ToListAsync(cancellationToken);
+
+            var latestHints = await GetLatestHintPerQuestionAsync(attemptId, language, cancellationToken);
+
+            return new RetrySet(
+                BuildRetryQuestions(rows, latestHints),
+                rows.Any(r => r.UsedFallback),
+                HintStatuses.Resolve(wrongQuestionIds.Count, wrongQuestionIds.Count(latestHints.ContainsKey)));
+        }
+
+        /// <summary>
+        /// Moves every attempt still InProgress past the allowed window to
+        /// Abandoned, database-side and in batches — nothing is loaded into memory.
+        /// Safe to run repeatedly and on several instances at once: the WHERE only
+        /// ever matches InProgress rows, so Completed attempts are never touched and
+        /// a second run finds nothing to do.
+        /// </summary>
+        public async Task<int> AbandonExpiredAttemptsAsync(CancellationToken cancellationToken = default)
+        {
+            var cutoff = AbandonCutoff;
+            var total = 0;
+            int affected;
+
+            do
+            {
+                affected = await _db.QuizAttempts
+                    .Where(a => a.Status == QuizAttemptStatuses.InProgress && a.StartedAt <= cutoff)
+                    .Take(AbandonSweepBatchSize)
+                    .ExecuteUpdateAsync(
+                        s => s.SetProperty(a => a.Status, QuizAttemptStatuses.Abandoned),
+                        cancellationToken);
+
+                total += affected;
+            }
+            while (affected == AbandonSweepBatchSize);
+
+            return total;
+        }
+
+        /// <summary>See <see cref="AssessmentSettings.AbandonCutoff"/>.</summary>
+        private DateTime AbandonCutoff => _settings.AbandonCutoff(_clock.UtcNow);
+
+        private bool IsExpired(DateTime startedAt) => startedAt <= AbandonCutoff;
+
+        private Task<int> MarkAbandonedAsync(long attemptId, CancellationToken cancellationToken) =>
+            _db.QuizAttempts
+                .Where(a => a.Id == attemptId && a.Status == QuizAttemptStatuses.InProgress)
+                .ExecuteUpdateAsync(
+                    s => s.SetProperty(a => a.Status, QuizAttemptStatuses.Abandoned),
+                    cancellationToken);
+
+        private static GoneException AttemptAbandoned(long attemptId) =>
+            new($"المحاولة رقم {attemptId} انتهت صلاحيتها قبل تسليمها، برجاء بدء محاولة جديدة");
 
         public async Task<QuizAttemptResponseDto> GetByIdAsync(
             long attemptId,
             Guid userId,
+            string? language = null,
             CancellationToken cancellationToken = default)
         {
+            var resolvedLanguage = ContentLanguages.Normalize(language);
+
             var attempt = await _db.QuizAttempts
                 .AsNoTracking()
                 .Where(a => a.Id == attemptId)
-                .Select(a => new { a.Id, a.QuizId, a.UserId, a.StartedAt })
+                .Select(a => new { a.Id, a.QuizId, a.UserId, a.StartedAt, a.Quiz.QuizType })
                 .FirstOrDefaultAsync(cancellationToken)
                 ?? throw new KeyNotFoundException($"المحاولة رقم {attemptId} غير موجودة");
 
             if (attempt.UserId != userId)
                 throw new UnauthorizedAccessException("لا يمكنك الوصول إلى محاولة مستخدم آخر");
 
-            var questions = await ProjectQuestions(
-                    _db.QuizAttemptQuestions
-                        .AsNoTracking()
-                        .Where(aq => aq.QuizAttemptId == attemptId)
-                        .Select(aq => aq.Question))
-                .ToListAsync(cancellationToken);
+            List<LocalizedQuestionRow> rows;
 
-            var latestHints = await GetLatestHintPerQuestionAsync(attemptId, cancellationToken);
-
-            foreach (var question in questions)
+            if (attempt.QuizType == QuizTypes.Placement)
             {
-                if (latestHints.TryGetValue(question.QuestionId, out var hintText))
-                    question.CurrentHint = hintText;
+                // Questions from several quizzes: rebuild the serving order (level,
+                // then DisplayOrder) and number it 1..n, exactly as Start served it.
+                var questionIds = await _db.QuizAttemptQuestions
+                    .AsNoTracking()
+                    .Where(aq => aq.QuizAttemptId == attemptId)
+                    .Select(aq => aq.QuestionId)
+                    .ToListAsync(cancellationToken);
+
+                rows = await LoadRowsInOrderAsync(
+                    await _placement.SortForServingAsync(questionIds, cancellationToken),
+                    resolvedLanguage,
+                    cancellationToken);
+
+                NumberInAttemptOrder(rows);
+            }
+            else
+            {
+                rows = await LocalizedQuestionQuery.Project(
+                        _db.QuizAttemptQuestions
+                            .AsNoTracking()
+                            .Where(aq => aq.QuizAttemptId == attemptId)
+                            .Select(aq => aq.Question),
+                        resolvedLanguage)
+                    .ToListAsync(cancellationToken);
+            }
+
+            var latestHints = await GetLatestHintPerQuestionAsync(attemptId, resolvedLanguage, cancellationToken);
+
+            foreach (var row in rows)
+            {
+                if (latestHints.TryGetValue(row.QuestionId, out var hintText))
+                    row.CurrentHint = hintText;
             }
 
             return new QuizAttemptResponseDto
@@ -514,54 +1393,131 @@ namespace AssessmentBL.Services
                 AttemptId = attempt.Id,
                 QuizId = attempt.QuizId,
                 StartedAt = attempt.StartedAt,
-                Questions = questions
+                Language = resolvedLanguage,
+                LanguageFallbackApplied = rows.Any(r => r.UsedFallback),
+                Questions = rows.Select(r => r.ToDto()).ToList()
             };
         }
 
-        private static List<QuizAttemptMistakeDto> ValidateSubmittedMistakes(
+        /// <summary>
+        /// Structural checks on the MCQ/TF answers: no nulls, no duplicates, only
+        /// questions of this attempt. Completeness is checked separately, across
+        /// every question type, by <see cref="EnsureEveryQuestionAnswered"/>.
+        /// </summary>
+        private static List<QuizAttemptMistakeDto> ValidateSubmittedAnswers(
             SubmitQuizAttemptDto dto,
-            HashSet<int> attemptQuestionIds)
+            HashSet<int> autoGradedQuestionIds)
         {
-            var mistakes = dto.Mistakes ?? new List<QuizAttemptMistakeDto>();
-            var seenQuestionIds = new HashSet<int>(mistakes.Count);
+            var answers = dto.Mistakes ?? new List<QuizAttemptMistakeDto>();
+            var seenQuestionIds = new HashSet<int>(answers.Count);
 
-            foreach (var mistake in mistakes)
+            foreach (var answer in answers)
             {
-                if (mistake is null)
-                    throw new ArgumentException("قائمة الأخطاء تحتوي على عنصر فارغ", nameof(dto));
+                if (answer is null)
+                    throw new ArgumentException("قائمة الإجابات تحتوي على عنصر فارغ", nameof(dto));
 
-                if (!seenQuestionIds.Add(mistake.QuestionId))
+                if (!seenQuestionIds.Add(answer.QuestionId))
                     throw new ArgumentException(
-                        $"السؤال رقم {mistake.QuestionId} مكرر في قائمة الأخطاء", nameof(dto));
+                        $"السؤال رقم {answer.QuestionId} مكرر في قائمة الإجابات", nameof(dto));
 
-                if (!attemptQuestionIds.Contains(mistake.QuestionId))
+                if (!autoGradedQuestionIds.Contains(answer.QuestionId))
                     throw new ArgumentException(
-                        $"السؤال رقم {mistake.QuestionId} لا يخص هذه المحاولة", nameof(dto));
+                        $"السؤال رقم {answer.QuestionId} لا يخص هذه المحاولة أو لا يُصحّح تلقائيًا", nameof(dto));
             }
 
-            return mistakes.ToList();
+            return answers.ToList();
         }
 
-        private static decimal CalculateScorePercentage(short correctAnswers, short totalQuestions)
+        private static List<QuizAttemptEssayAnswerDto> ValidateSubmittedEssays(
+            SubmitQuizAttemptDto dto,
+            HashSet<int> essayQuestionIds,
+            int maxAnswerLength)
         {
-            if (totalQuestions <= 0)
+            var essays = dto.EssayAnswers ?? new List<QuizAttemptEssayAnswerDto>();
+            var seenQuestionIds = new HashSet<int>(essays.Count);
+
+            foreach (var essay in essays)
+            {
+                if (essay is null)
+                    throw new ArgumentException("قائمة الإجابات المقالية تحتوي على عنصر فارغ", nameof(dto));
+
+                if (!seenQuestionIds.Add(essay.QuestionId))
+                    throw new ArgumentException(
+                        $"السؤال رقم {essay.QuestionId} مكرر في قائمة الإجابات المقالية", nameof(dto));
+
+                if (!essayQuestionIds.Contains(essay.QuestionId))
+                    throw new ArgumentException(
+                        $"السؤال رقم {essay.QuestionId} ليس سؤالًا مقاليًا في هذه المحاولة", nameof(dto));
+
+                // A blank essay is an unanswered question, not an answer.
+                if (string.IsNullOrWhiteSpace(essay.AnswerText))
+                    throw new ArgumentException(
+                        $"إجابة السؤال رقم {essay.QuestionId} فارغة", nameof(dto));
+
+                // The column is nvarchar(max); this is the only bound on it.
+                if (essay.AnswerText.Trim().Length > maxAnswerLength)
+                    throw new ArgumentException(
+                        $"إجابة السؤال رقم {essay.QuestionId} تتجاوز {maxAnswerLength} حرفًا", nameof(dto));
+            }
+
+            return essays.ToList();
+        }
+
+        /// <summary>
+        /// Every question of the attempt — MultipleChoice, TrueFalse and Essay —
+        /// must be answered. An omitted answer used to be counted as correct (an
+        /// empty submission scored 100% and could place a child at the top level)
+        /// and an omitted essay was silently dropped. The 400 lists every
+        /// unanswered question so the app can point the child at them.
+        /// </summary>
+        private static void EnsureEveryQuestionAnswered(
+            IEnumerable<int> attemptQuestionIds,
+            IReadOnlySet<int> answeredQuestionIds)
+        {
+            var unanswered = attemptQuestionIds
+                .Where(id => !answeredQuestionIds.Contains(id))
+                .OrderBy(id => id)
+                .ToList();
+
+            if (unanswered.Count > 0)
+                throw new ArgumentException(
+                    $"يجب الإجابة على كل أسئلة الاختبار؛ الأسئلة بدون إجابة: {string.Join(", ", unanswered)}",
+                    "dto");
+        }
+
+        /// <summary>
+        /// Score is computed over auto-graded questions only. Essay answers are
+        /// stored for review and never enter the numerator or the denominator.
+        /// </summary>
+        private static decimal CalculateScorePercentage(short correctAnswers, short autoGradedQuestions)
+        {
+            if (autoGradedQuestions <= 0)
                 return 0m;
 
-            return Math.Round(correctAnswers * 100m / totalQuestions, 2, MidpointRounding.AwayFromZero);
+            return Math.Round(correctAnswers * 100m / autoGradedQuestions, 2, MidpointRounding.AwayFromZero);
         }
 
+        /// <summary>
+        /// Latest hint per question in the requested language. When a question has
+        /// no hint in that language (the child switched language mid-chain), the
+        /// latest hint in any language is returned rather than nothing.
+        /// </summary>
         private async Task<Dictionary<int, string>> GetLatestHintPerQuestionAsync(
             long quizAttemptId,
+            string language,
             CancellationToken cancellationToken)
         {
+            // Keyed on the hint's own attempt + question, so a Hint-button hint
+            // taken mid-attempt shows up here too.
             var hints = await _db.QuestionHints
                 .AsNoTracking()
-                .Where(h => h.QuizAttemptMistake.QuizAttemptId == quizAttemptId)
+                .Where(h => h.QuizAttemptId == quizAttemptId)
                 .Select(h => new
                 {
-                    h.QuizAttemptMistake.QuestionId,
+                    h.QuestionId,
                     h.HintSequence,
-                    h.HintText
+                    h.HintText,
+                    h.LanguageCode
                 })
                 .ToListAsync(cancellationToken);
 
@@ -569,29 +1525,35 @@ namespace AssessmentBL.Services
                 .GroupBy(h => h.QuestionId)
                 .ToDictionary(
                     g => g.Key,
-                    g => g.OrderByDescending(h => h.HintSequence).First().HintText);
+                    g =>
+                    {
+                        var inLanguage = g.Where(h => h.LanguageCode == language).ToList();
+                        var pool = inLanguage.Count > 0 ? inLanguage : g.ToList();
+                        return pool.OrderByDescending(h => h.HintSequence).First().HintText;
+                    });
         }
 
-        private static IQueryable<QuizQuestionForAttemptDto> ProjectQuestions(IQueryable<Question> questions) =>
-            questions
-                .OrderBy(q => q.DisplayOrder)
-                .Select(q => new QuizQuestionForAttemptDto
-                {
-                    QuestionId = q.Id,
-                    QuestionText = q.QuestionText,
-                    Difficulty = q.Difficulty,
-                    DisplayOrder = q.DisplayOrder,
-                    Points = q.Points,
-                    CurrentHint = null,
-                    Options = q.QuestionOptions
-                        .OrderBy(o => o.DisplayOrder)
-                        .Select(o => new QuizAnswerOptionDto
-                        {
-                            OptionId = o.Id,
-                            OptionText = o.OptionText,
-                            DisplayOrder = o.DisplayOrder,
-                        })
-                        .ToList()
-                });
+        /// <summary>What Phase A committed — everything Phase B needs, as plain values.</summary>
+        private sealed record GradedSubmission(
+            long AttemptId,
+            int QuizId,
+            DateTime CompletedAt,
+            short TotalQuestions,
+            short AutoGradedQuestions,
+            short EssayCount,
+            short CorrectAnswers,
+            decimal ScorePercentage,
+            IReadOnlyList<RecordedMistake> Mistakes,
+            PlacementResultDto? Placement);
+
+        private sealed record RecordedMistake(long Id, int QuestionId, int SelectedOptionId);
+
+        private sealed record RetrySet(
+            List<QuizQuestionForAttemptDto> Questions,
+            bool UsedFallback,
+            string HintsStatus)
+        {
+            public static RetrySet None() => new([], false, HintStatuses.NotRequired);
+        }
     }
 }

@@ -1,4 +1,4 @@
-﻿using AssessmentBL.DTOs.UserTopicStat;
+using AssessmentBL.DTOs.UserTopicStat;
 using AssessmentBL.Interfaces;
 using AssessmentDA.Context;
 using AssessmentDA.Entities;
@@ -70,6 +70,9 @@ namespace AssessmentBL.Services
         /// aggregates. Counts come from that attempt's own QuizAttemptQuestion
         /// rows, so a retry contributes only the questions it actually
         /// contained. WrongCount is never assigned — SQL Server computes it.
+        ///
+        /// A fixed number of round trips whatever the attempt size: every read
+        /// happens before the bucket loop, and the loop itself is in-memory only.
         /// </summary>
         public async Task UpdateAfterQuizAttemptAsync(
             long quizAttemptId,
@@ -100,9 +103,13 @@ namespace AssessmentBL.Services
             // the classification frozen at attempt start. Reading TopicId /
             // Difficulty from the live Question row here would re-attribute
             // this attempt's counters if an admin later re-classified it.
+            //
+            // Essay answers are not auto-graded, so counting them as "answered"
+            // with no possible "correct" would permanently depress the child's
+            // mastery for that topic. They are excluded until a grader scores them.
             var attemptQuestions = await _db.QuizAttemptQuestions
                 .AsNoTracking()
-                .Where(aq => aq.QuizAttemptId == quizAttemptId)
+                .Where(aq => aq.QuizAttemptId == quizAttemptId && aq.QuestionType != QuestionTypes.Essay)
                 .Select(aq => new
                 {
                     aq.QuestionId,
@@ -114,38 +121,36 @@ namespace AssessmentBL.Services
             if (attemptQuestions.Count == 0)
                 return;
 
-            var hintCountsByTopicAndDifficulty = await _db.QuestionHints
-                .AsNoTracking()
-                .Where(h => h.QuizAttemptMistake.QuizAttempt.UserId == userId)
-                .GroupBy(h => new
-                {
-                    h.QuizAttemptMistake.QuizAttemptQuestion.TopicId,
-                    h.QuizAttemptMistake.QuizAttemptQuestion.Difficulty
-                })
-                .Select(g => new { g.Key.TopicId, g.Key.Difficulty, Count = g.Count() })
-                .ToListAsync(cancellationToken);
-            var hintCounts = hintCountsByTopicAndDifficulty.ToDictionary(
-                x => (x.TopicId, x.Difficulty), x => x.Count);
+            // Every question this attempt got wrong, fetched ONCE. This replaces a
+            // per-question _db.QuizAttemptMistakes.Any(...) that ran synchronously
+            // inside the grouping below — one blocking query per question.
+            var wrongQuestionIds = (await _db.QuizAttemptMistakes
+                    .AsNoTracking()
+                    .Where(m => m.QuizAttemptId == quizAttemptId)
+                    .Select(m => m.QuestionId)
+                    .ToListAsync(cancellationToken))
+                .ToHashSet();
+
+            var topicIds = attemptQuestions.Select(q => q.TopicId).Distinct().ToList();
+
+            var hintCounts = await CountHintsByBucketAsync(userId, topicIds, cancellationToken);
 
             var buckets = attemptQuestions
-                .GroupBy(q => new { q.TopicId, q.Difficulty })
+                .GroupBy(q => (q.TopicId, q.Difficulty))
                 .Select(g => new
                 {
                     g.Key.TopicId,
                     g.Key.Difficulty,
                     Answered = g.Count(),
-                    Correct = g.Count(q => !_db.QuizAttemptMistakes.Any(m =>
-                        m.QuizAttemptId == quizAttemptId && m.QuestionId == q.QuestionId)),
-                    Hints = hintCounts.GetValueOrDefault((g.Key.TopicId, g.Key.Difficulty))
+                    Correct = g.Count(q => !wrongQuestionIds.Contains(q.QuestionId)),
+                    Hints = hintCounts.GetValueOrDefault(g.Key)
                 })
                 .ToList();
-
-            var topicIds = buckets.Select(b => b.TopicId).Distinct().ToList();
 
             // One tracked read for every row we might touch — no per-bucket query.
             var existingStats = await _db.UserTopicStats
                 .Where(s => s.UserId == userId && topicIds.Contains(s.TopicId))
-                .ToListAsync(cancellationToken);
+                .ToDictionaryAsync(s => (s.TopicId, s.Difficulty), cancellationToken);
 
             // CK_QuizAttempts_CompletedRequiresAllAnswered guarantees a
             // completed attempt has CompletedAt, so the fallback is belt-and-braces.
@@ -153,10 +158,7 @@ namespace AssessmentBL.Services
 
             foreach (var bucket in buckets)
             {
-                var stat = existingStats.FirstOrDefault(
-                    s => s.TopicId == bucket.TopicId && s.Difficulty == bucket.Difficulty);
-
-                if (stat is null)
+                if (!existingStats.TryGetValue((bucket.TopicId, bucket.Difficulty), out var stat))
                 {
                     stat = new UserTopicStat
                     {
@@ -169,7 +171,6 @@ namespace AssessmentBL.Services
                     };
 
                     _db.UserTopicStats.Add(stat);
-                    existingStats.Add(stat);
                 }
 
                 stat.QuestionsAnsweredCount += bucket.Answered;
@@ -183,5 +184,72 @@ namespace AssessmentBL.Services
             await _db.SaveChangesAsync(cancellationToken);
         }
 
+        /// <summary>
+        /// Re-derives HintsUsedCount for the buckets an attempt touched. Needed
+        /// because hints are now saved AFTER the submission commits. Idempotent:
+        /// the value is recomputed from saved hints, never accumulated.
+        /// </summary>
+        public async Task RefreshHintsUsedCountAsync(
+            long quizAttemptId,
+            Guid userId,
+            CancellationToken cancellationToken = default)
+        {
+            var buckets = await _db.QuizAttemptQuestions
+                .AsNoTracking()
+                .Where(aq => aq.QuizAttemptId == quizAttemptId
+                          && aq.QuizAttempt.UserId == userId
+                          && aq.QuestionType != QuestionTypes.Essay)
+                .Select(aq => new { aq.TopicId, aq.Difficulty })
+                .Distinct()
+                .ToListAsync(cancellationToken);
+
+            if (buckets.Count == 0)
+                return;
+
+            var topicIds = buckets.Select(b => b.TopicId).Distinct().ToList();
+            var touched = buckets.Select(b => (b.TopicId, b.Difficulty)).ToHashSet();
+
+            var hintCounts = await CountHintsByBucketAsync(userId, topicIds, cancellationToken);
+
+            var stats = await _db.UserTopicStats
+                .Where(s => s.UserId == userId && topicIds.Contains(s.TopicId))
+                .ToListAsync(cancellationToken);
+
+            foreach (var stat in stats)
+            {
+                if (touched.Contains((stat.TopicId, stat.Difficulty)))
+                    stat.HintsUsedCount = hintCounts.GetValueOrDefault((stat.TopicId, stat.Difficulty));
+            }
+
+            await _db.SaveChangesAsync(cancellationToken);
+        }
+
+        /// <summary>
+        /// Hints the user has received, per (topic, difficulty) of the question
+        /// they were for — limited to the topics being written. It used to
+        /// aggregate every hint the child had ever received, across all topics, on
+        /// every submission.
+        /// </summary>
+        private async Task<Dictionary<(int TopicId, string Difficulty), int>> CountHintsByBucketAsync(
+            Guid userId,
+            List<int> topicIds,
+            CancellationToken cancellationToken)
+        {
+            // Through the hint's own (attempt, question) link, so Hint-button hints
+            // — which have no mistake row — are counted too.
+            var rows = await _db.QuestionHints
+                .AsNoTracking()
+                .Where(h => h.QuizAttemptQuestion.QuizAttempt.UserId == userId
+                         && topicIds.Contains(h.QuizAttemptQuestion.TopicId))
+                .GroupBy(h => new
+                {
+                    h.QuizAttemptQuestion.TopicId,
+                    h.QuizAttemptQuestion.Difficulty
+                })
+                .Select(g => new { g.Key.TopicId, g.Key.Difficulty, Count = g.Count() })
+                .ToListAsync(cancellationToken);
+
+            return rows.ToDictionary(x => (x.TopicId, x.Difficulty), x => x.Count);
+        }
     }
 }
