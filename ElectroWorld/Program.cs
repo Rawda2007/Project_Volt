@@ -106,11 +106,11 @@ builder.Services.AddAuthorization();
 var app = builder.Build();
 
 // ---------- Pipeline ----------
-//if (app.Environment.IsDevelopment())
-//{
+if (app.Environment.IsDevelopment())
+{
     app.UseSwagger();
     app.UseSwaggerUI();
-//}
+}
 
 app.UseHttpsRedirection();
 app.UseMiddleware<ExceptionMiddleware>();
