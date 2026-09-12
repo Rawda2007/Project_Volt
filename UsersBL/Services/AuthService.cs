@@ -54,6 +54,28 @@ public class AuthService : IAuthService
             ? UserRoles.Parent
             : UserRoles.Child;
 
+    private static bool IsValidEmail(string email)
+    {
+        if (string.IsNullOrWhiteSpace(email))
+            return false;
+
+        try
+        {
+            // System.Net.Mail.MailAddress بيتأكد من الصيغة العامة للإيميل (فيه @، دومين صحيح...)
+            var address = new System.Net.Mail.MailAddress(email);
+            return address.Address == email;
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
+
+    private const int MinAge = 7;
+    private const int MaxAge = 18;
+
+    private static bool IsValidAge(int? age) => age is null || (age >= MinAge && age <= MaxAge);
+
     public async Task<Result<AuthResponse>> RegisterGuestAsync(RegisterGuestRequest request, CancellationToken ct = default)
     {
         var user = new User
@@ -76,6 +98,12 @@ public class AuthService : IAuthService
 
     public async Task<Result<AuthResponse>> RegisterWithEmailAsync(RegisterEmailRequest request, CancellationToken ct = default)
     {
+        if (!IsValidEmail(request.Email))
+            return Result<AuthResponse>.Failure("صيغة الإيميل غير صحيحة");
+
+        if (!IsValidAge(request.Age))
+            return Result<AuthResponse>.Failure($"السن لازم يكون بين {MinAge} و {MaxAge} سنة");
+
         if (await _userRepository.EmailExistsAsync(request.Email, ct))
             return Result<AuthResponse>.Failure("البريد الإلكتروني مستخدم بالفعل");
 
@@ -120,6 +148,9 @@ public class AuthService : IAuthService
 
     public async Task<Result<AuthResponse>> LoginWithEmailAsync(LoginEmailRequest request, CancellationToken ct = default)
     {
+        if (!IsValidEmail(request.Email))
+            return Result<AuthResponse>.Failure("صيغة الإيميل غير صحيحة");
+
         var user = await _userRepository.GetByEmailAsync(request.Email, ct);
         if (user is null || user.PasswordHash is null || !_passwordHasher.Verify(request.Password, user.PasswordHash))
             return Result<AuthResponse>.Failure("بيانات الدخول غير صحيحة");

@@ -2,6 +2,7 @@ using ElectroWorld.Swagger;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Shared.Common.Api;
+using Shared.Users;
 using UsersBL.DTOs;
 using UsersBL.Interfaces;
 
@@ -12,7 +13,13 @@ namespace ElectroWorld.Controllers.Users;
 public class AuthController : ControllerBase
 {
     private readonly IAuthService _authService;
-    public AuthController(IAuthService authService) => _authService = authService;
+    private readonly IUserService _userService;
+
+    public AuthController(IAuthService authService, IUserService userService)
+    {
+        _authService = authService;
+        _userService = userService;
+    }
 
     // ملحوظة: RegisterGuestAsync في الـ Service مفيهاش أي مسار فشل حاليًا (بتنجح دايمًا)،
     // فمفيش 400 موثّق هنا عمدًا - توثيق حالة مش ممكن تحصل فعليًا هيكون تضليل.
@@ -131,5 +138,28 @@ public class AuthController : ControllerBase
         return result.IsSuccess
             ? Ok(ApiResponse.Ok("تم تغيير كلمة المرور بنجاح"))
             : BadRequest(ApiResponse.Fail(result.Error!));
+    }
+
+    /// <summary>
+    /// لإدخال السن بعد تسجيل Google (اللي مبيدخلش السن وقت التسجيل نفسه) - الفلاتر بتعرض
+    /// شاشة سن بعد الـ Google Sign-In مباشرة وتنادي على الـ Endpoint ده.
+    /// الـ UserId بياخده من الـ Access Token في الـ Header (Authorization: Bearer ...)،
+    /// مش من الـ Body - يعني الـ Body محتاج بس { "age": ... }.
+    /// </summary>
+    [HttpPatch("age")]
+    [Authorize]
+    [ProducesResponseType(typeof(ApiResponse<UserProfileResponse>), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(ApiResponse<UserProfileResponse>), StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [SwaggerExample(200, """{"success":true,"message":"تم تحديث السن بنجاح","data":{"id":"3fa85f64-5717-4562-b3fc-2c963f66afa6","email":"ahmed@example.com","fullName":"Ahmed Ali","role":"Child","authProvider":"Google","age":12,"isActive":true,"convertedFromGuestAt":null,"createdAt":"2026-08-01T10:00:00Z"}}""")]
+    [SwaggerExample(400, """{"success":false,"message":"السن لازم يكون بين 7 و 18 سنة","data":null}""")]
+    public async Task<IActionResult> SetAge([FromBody] SetAgeRequest request, CancellationToken ct)
+    {
+        var userId = User.GetUserId(); // من التوكن، مش من الفلاتر
+        var result = await _userService.SetAgeAsync(userId, request, ct);
+
+        return result.IsSuccess
+            ? Ok(ApiResponse<UserProfileResponse>.Ok(result.Value!, "تم تحديث السن بنجاح"))
+            : BadRequest(ApiResponse<UserProfileResponse>.Fail(result.Error!));
     }
 }
