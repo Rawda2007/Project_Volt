@@ -12,3 +12,5 @@ public record UserProfileResponse(
     DateTime CreatedAt);
 
 public record UpdateProfileRequest(string FullName, int? Age);
+
+public record SetAgeRequest(int Age);
