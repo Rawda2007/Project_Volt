@@ -6,9 +6,9 @@
     "fullName": "Ahmed Ali",
     "role": "Parent",
     "authProvider": "Email",
-    "age": 35,
+    "age": null,
     "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIzZmE4NWY2NC01NzE3LTQ1NjItYjNmYy0yYzk2M2Y2NmFmYTYifQ.mock-signature",
-    "refreshToken": "cXVpY2tSZWZyZXNoVG9rZW5WYWx1ZUV4YW1wbGU=",
-    "accessTokenExpiresAt": "2026-09-10T12:15:00.0000000Z"
+    "refreshToken": "GJ/nyDDoO9Dk1crNX2BrVQ1dZdo164qwIrDtKbEOfn8k62d9bR+1QbjSFatPX4b5NnXeNZ6Hg5UKuEvcWXR73w==",
+    "accessTokenExpiresAt": "2026-09-10T12:15:00.5317264Z"
   }
 }

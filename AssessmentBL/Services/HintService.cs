@@ -23,6 +23,14 @@ namespace AssessmentBL.Services
     /// correct answer: both go through the same leak checks, and a level-2 hint
     /// that fails them is dropped exactly like a level-1 one.
     ///
+    /// Only a hint the child actually sees uses a level. A Partial or Unavailable
+    /// press saves nothing, so it is not counted against the child: the next press
+    /// asks for the same level again, and the hint statistics never see it.
+    ///
+    /// Two presses at the same moment both read the same level. The database
+    /// settles it: UQ_QuestionHints_AttemptId_QuestionId_AttemptNumber lets one
+    /// save that level, in any language, and the other gets a 409 with nothing saved.
+    ///
     /// Nothing here touches scoring: hints are written to their own table and the
     /// submit pipeline is unchanged.
     /// </summary>
@@ -63,15 +71,14 @@ namespace AssessmentBL.Services
         {
             var resolvedLanguage = ContentLanguages.Normalize(language);
 
+            // Filtered on the owner: another user's attempt is reported exactly like
+            // one that does not exist, so a 404 never confirms that an id is real.
             var attempt = await _db.QuizAttempts
                 .AsNoTracking()
-                .Where(a => a.Id == attemptId)
-                .Select(a => new { a.UserId, a.Status, a.StartedAt, a.Quiz.QuizType })
+                .Where(a => a.Id == attemptId && a.UserId == userId)
+                .Select(a => new { a.Status, a.StartedAt, a.Quiz.QuizType })
                 .FirstOrDefaultAsync(cancellationToken)
                 ?? throw new KeyNotFoundException($"المحاولة رقم {attemptId} غير موجودة");
-
-            if (attempt.UserId != userId)
-                throw new UnauthorizedAccessException("لا يمكنك طلب تلميح لمحاولة مستخدم آخر");
 
             if (attempt.Status == QuizAttemptStatuses.Abandoned
                 || (attempt.Status == QuizAttemptStatuses.InProgress
@@ -171,6 +178,7 @@ namespace AssessmentBL.Services
                 AttemptNumber = attemptNumber,
                 Hint = hint,
                 HintsStatus = HintStatuses.Generated,
+                HintsRemaining = HintsRemaining(_settings.EffectiveMaxHintLevels, attemptNumber, HintStatuses.Generated),
                 Language = resolvedLanguage
             };
         }
@@ -321,23 +329,37 @@ namespace AssessmentBL.Services
                 await _db.SaveChangesAsync(cancellationToken);
             }
             catch (DbUpdateException ex) when (
-                ex.IsUniqueViolationOf("UQ_QuestionHints_AttemptId_QuestionId_Language_Sequence"))
+                ex.IsUniqueViolationOf("UQ_QuestionHints_AttemptId_QuestionId_AttemptNumber")
+             || ex.IsUniqueViolationOf("UQ_QuestionHints_AttemptId_QuestionId_Language_Sequence"))
             {
-                // Two presses at once: the other one is already saved and is the
-                // hint of this level.
+                // Two presses at once — in one language or in two — both computed
+                // this level. The other one is already saved and is the hint of this
+                // level; this one saved nothing and used no level.
                 _db.ChangeTracker.Clear();
                 throw new ConflictException("تم طلب تلميح لنفس السؤال بالفعل، برجاء المحاولة مرة أخرى", ex);
             }
         }
 
-        private static HintResponseDto NoHint(int questionId, byte attemptNumber, string language, string status) =>
+        private HintResponseDto NoHint(int questionId, byte attemptNumber, string language, string status) =>
             new()
             {
                 QuestionId = questionId,
                 AttemptNumber = attemptNumber,
                 Hint = null,
                 HintsStatus = status,
+                HintsRemaining = HintsRemaining(_settings.EffectiveMaxHintLevels, attemptNumber, status),
                 Language = language
             };
+
+        /// <summary>
+        /// Hint-button levels left for the question after this press. Only a
+        /// Generated hint — one the child sees — uses its level; after a Partial or
+        /// Unavailable press the count is what it was before.
+        /// </summary>
+        public static int HintsRemaining(int maxLevels, byte attemptNumber, string hintsStatus)
+        {
+            var used = hintsStatus == HintStatuses.Generated ? attemptNumber : attemptNumber - 1;
+            return Math.Max(maxLevels - used, 0);
+        }
     }
 }

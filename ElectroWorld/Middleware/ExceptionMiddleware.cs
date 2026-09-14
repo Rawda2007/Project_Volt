@@ -65,14 +65,19 @@ namespace ElectroWorld.Middleware
                 ? argument.Message.Replace($" (Parameter '{param}')", string.Empty)
                 : exception.Message;
 
+        // InvalidOperationException is deliberately NOT mapped: EF Core and the
+        // framework throw it for internal faults, and its message must never reach
+        // the client. Business rules throw BusinessRuleException instead.
+        //
+        // There is no 403 for "another user's record" either: services report it
+        // as KeyNotFoundException, so a 404 never confirms that an id exists.
         private static int MapStatusCode(Exception exception) => exception switch
         {
             KeyNotFoundException => (int)HttpStatusCode.NotFound,
             ConflictException => (int)HttpStatusCode.Conflict,
             GoneException => (int)HttpStatusCode.Gone,
+            BusinessRuleException => (int)HttpStatusCode.BadRequest,
             ArgumentException => (int)HttpStatusCode.BadRequest,
-            InvalidOperationException => (int)HttpStatusCode.BadRequest,
-            UnauthorizedAccessException => (int)HttpStatusCode.Forbidden,
             _ => (int)HttpStatusCode.InternalServerError
         };
 

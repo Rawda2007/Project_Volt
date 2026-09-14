@@ -15,9 +15,15 @@
    signal to use a Shared contract instead (ILessonAvailability, ILevelCatalog,
    ILearnerProfile are the existing ones) — not to add the FK here.
 
-   End state: this equals the schema after migrations 002–009, so a database
-   built from this script needs none of them. Existing databases keep using the
-   numbered migrations.
+   End state: this is the current schema, so a database built from this script
+   needs no migration. A database built from an EARLIER version of this script
+   is brought up to date by the numbered migrations in this folder, in order:
+       001_points_ai_essays_image_descriptions.sql — snapshot Points per
+           attempt question, AI-only essay grading, and a required description
+           for every image.
+       002_optional_topics_hint_level_uniqueness.sql — a question may belong
+           to no topic, and each Hint-button level is saved once per attempt
+           and question, whatever the language.
 
    Run against an empty database, then scaffold AssessmentDA from it.
    ========================================================================== */
@@ -60,7 +66,7 @@ GO
 
 CREATE TABLE Assessment.Categories
 (
-    -- Not IDENTITY: ids are assigned by seed data.
+    -- Not IDENTITY: ids are assigned by seed data, or by the API as the lowest free id.
     Id          TINYINT         NOT NULL,
     Name        NVARCHAR(100)   NOT NULL,
     SortOrder   SMALLINT        NOT NULL CONSTRAINT DF_Categories_SortOrder DEFAULT (0),
@@ -191,13 +197,16 @@ CREATE TABLE Assessment.Questions
 (
     Id                  INT IDENTITY(1,1)   NOT NULL,
     QuizId              INT                 NOT NULL,
-    TopicId             INT                 NOT NULL,
+    -- Optional: a question with no topic is asked, graded and earns XP like any
+    -- other, and counts toward no topic in UserTopicStats.
+    TopicId             INT                 NULL,
     QuestionText        NVARCHAR(MAX)       NOT NULL,
     QuestionType        NVARCHAR(30)        NOT NULL
         CONSTRAINT DF_Questions_QuestionType DEFAULT ('MultipleChoice'),
     -- Server-relative path, e.g. /uploads/lessons/x.png. Never sent to the AI.
     ImageUrl            NVARCHAR(500)       NULL,
     -- Admin-authored meaning of the image, for the AI. Never shown to a child.
+    -- Required whenever ImageUrl is set; NULL when there is no image.
     ImageDescription    NVARCHAR(1000)      NULL,
     Difficulty          NVARCHAR(20)        NOT NULL CONSTRAINT DF_Questions_Difficulty DEFAULT ('Medium'),
     DisplayOrder        SMALLINT            NOT NULL CONSTRAINT DF_Questions_DisplayOrder DEFAULT (0),
@@ -214,7 +223,12 @@ CREATE TABLE Assessment.Questions
     CONSTRAINT FK_Questions_Topics FOREIGN KEY (TopicId) REFERENCES Assessment.Topics (Id),
     CONSTRAINT CK_Questions_QuestionType CHECK (QuestionType IN ('MultipleChoice', 'TrueFalse', 'Essay')),
     CONSTRAINT CK_Questions_Difficulty CHECK (Difficulty IN ('Easy', 'Medium', 'Hard', 'Advanced')),
-    CONSTRAINT CK_Questions_Points CHECK (Points > 0)
+    CONSTRAINT CK_Questions_Points CHECK (Points > 0),
+    -- The AI never looks at images, only at text: a question with an image must
+    -- say in words what the image shows.
+    CONSTRAINT CK_Questions_ImageHasDescription
+        CHECK (ImageUrl IS NULL
+            OR (ImageDescription IS NOT NULL AND LTRIM(RTRIM(ImageDescription)) <> N''))
 );
 GO
 
@@ -260,10 +274,10 @@ CREATE TABLE Assessment.QuestionOptions
     CONSTRAINT FK_QuestionOptions_Questions FOREIGN KEY (QuestionId)
         REFERENCES Assessment.Questions (Id) ON DELETE CASCADE,
     CONSTRAINT CK_QuestionOptions_TextOrImage CHECK (OptionText IS NOT NULL OR ImageUrl IS NOT NULL),
-    -- An option the child can only see as an image must carry a description, or
-    -- the AI has nothing to reason about.
-    CONSTRAINT CK_QuestionOptions_ImageOptionHasDescription
-        CHECK ((OptionText IS NOT NULL AND LTRIM(RTRIM(OptionText)) <> N'')
+    -- Any option with an image must describe it, even when it also has text: the
+    -- AI reads text only, and the text may just label the picture.
+    CONSTRAINT CK_QuestionOptions_ImageHasDescription
+        CHECK (ImageUrl IS NULL
             OR (ImageDescription IS NOT NULL AND LTRIM(RTRIM(ImageDescription)) <> N''))
 );
 GO
@@ -358,14 +372,19 @@ CREATE TABLE Assessment.QuizAttemptQuestions
     Id              BIGINT IDENTITY(1,1)    NOT NULL,
     QuizAttemptId   BIGINT                  NOT NULL,
     QuestionId      INT                     NOT NULL,
-    -- Classification and answer key FROZEN at attempt start: an admin editing the
-    -- question later cannot re-grade an in-flight attempt or re-attribute its
-    -- statistics.
-    TopicId         INT                     NOT NULL,
+    -- Classification, answer key and weight FROZEN at attempt start: an admin
+    -- editing the question later cannot re-grade or re-weight an in-flight
+    -- attempt or re-attribute its statistics. TopicId is NULL when the question
+    -- had no topic.
+    TopicId         INT                     NULL,
     Difficulty      NVARCHAR(20)            NOT NULL,
     CorrectOptionId INT                     NULL,
     QuestionType    NVARCHAR(30)            NOT NULL
         CONSTRAINT DF_QuizAttemptQuestions_QuestionType DEFAULT ('MultipleChoice'),
+    -- Questions.Points at attempt start. The score, an essay's MaxPoints, the
+    -- placement and the result totals are counted from this, never the live value.
+    Points          TINYINT                 NOT NULL
+        CONSTRAINT DF_QuizAttemptQuestions_Points DEFAULT (1),
     CreatedAt       DATETIME2(3)            NOT NULL
         CONSTRAINT DF_QuizAttemptQuestions_CreatedAt DEFAULT (SYSUTCDATETIME()),
 
@@ -389,7 +408,8 @@ CREATE TABLE Assessment.QuizAttemptQuestions
     -- Only an Essay has no answer key.
     CONSTRAINT CK_QuizAttemptQuestions_EssayHasNoKey
         CHECK ((QuestionType = 'Essay' AND CorrectOptionId IS NULL)
-            OR (QuestionType <> 'Essay' AND CorrectOptionId IS NOT NULL))
+            OR (QuestionType <> 'Essay' AND CorrectOptionId IS NOT NULL)),
+    CONSTRAINT CK_QuizAttemptQuestions_Points CHECK (Points > 0)
 );
 GO
 
@@ -445,18 +465,20 @@ CREATE TABLE Assessment.QuizAttemptEssayAnswers
     -- The language the child answered in; AI feedback is written in it.
     LanguageCode            NVARCHAR(5)             NOT NULL
         CONSTRAINT DF_QuizAttemptEssayAnswers_LanguageCode DEFAULT (N'ar'),
-    -- The question's Points frozen at submission: the grade's ceiling.
+    -- Copied at submit from QuizAttemptQuestions.Points (the question's Points
+    -- frozen at attempt start): the grade's ceiling.
     MaxPoints               TINYINT                 NOT NULL
         CONSTRAINT DF_QuizAttemptEssayAnswers_MaxPoints DEFAULT (1),
-    -- The AI's proposal and the backend's decision on it.
+    -- AI evaluation state. Essays are graded by the AI only; AiOutcome says how
+    -- the evaluation ended (NULL while Pending).
     AiOutcome               NVARCHAR(20)            NULL,
     AiEvaluationAttempts    TINYINT                 NOT NULL
         CONSTRAINT DF_QuizAttemptEssayAnswers_AiEvaluationAttempts DEFAULT (0),
     AiLastAttemptAt         DATETIME2(3)            NULL,
     AiClaimId               UNIQUEIDENTIFIER        NULL,
-    AiProposedPoints        TINYINT                 NULL,
+    -- Reported by the AI with its grade, if at all. Monitoring only: it never
+    -- decides whether the grade is accepted.
     AiConfidence            DECIMAL(3,2)            NULL,
-    AiFeedback              NVARCHAR(MAX)           NULL,
 
     CONSTRAINT PK_QuizAttemptEssayAnswers PRIMARY KEY CLUSTERED (Id),
     CONSTRAINT UQ_QuizAttemptEssayAnswers_AttemptId_QuestionId UNIQUE (QuizAttemptId, QuestionId),
@@ -469,23 +491,30 @@ CREATE TABLE Assessment.QuizAttemptEssayAnswers
         REFERENCES Assessment.QuizAttemptQuestions (QuizAttemptId, QuestionId),
     CONSTRAINT FK_QuizAttemptEssayAnswers_Languages FOREIGN KEY (LanguageCode)
         REFERENCES Assessment.Languages (Code),
-    CONSTRAINT CK_QuizAttemptEssayAnswers_Status CHECK (Status IN ('Pending', 'Graded', 'Skipped')),
-    CONSTRAINT CK_QuizAttemptEssayAnswers_GradedBy CHECK (GradedBy IS NULL OR GradedBy IN ('Human', 'Ai')),
-    -- A graded answer carries its grade and its grader; a pending one carries none.
+    -- Pending = waiting for the AI; Graded and NotGraded are final.
+    CONSTRAINT CK_QuizAttemptEssayAnswers_Status CHECK (Status IN ('Pending', 'Graded', 'NotGraded')),
+    -- The AI is the only grader.
+    CONSTRAINT CK_QuizAttemptEssayAnswers_GradedBy CHECK (GradedBy IS NULL OR GradedBy = 'Ai'),
+    -- A graded answer carries its grade and its grader; any other carries none.
     CONSTRAINT CK_QuizAttemptEssayAnswers_GradedIsComplete
         CHECK ((Status = 'Graded' AND AwardedPoints IS NOT NULL AND GradedAt IS NOT NULL AND GradedBy IS NOT NULL)
             OR (Status <> 'Graded' AND AwardedPoints IS NULL AND GradedAt IS NULL AND GradedBy IS NULL)),
     CONSTRAINT CK_QuizAttemptEssayAnswers_AwardedWithinMax
         CHECK (AwardedPoints IS NULL OR AwardedPoints <= MaxPoints),
     CONSTRAINT CK_QuizAttemptEssayAnswers_AiOutcome
-        CHECK (AiOutcome IS NULL OR AiOutcome IN ('Accepted', 'NeedsReview', 'Failed')),
+        CHECK (AiOutcome IS NULL OR AiOutcome IN ('Accepted', 'Declined', 'Failed')),
+    -- Pending has no outcome yet; a final status always says how it ended.
+    CONSTRAINT CK_QuizAttemptEssayAnswers_OutcomeMatchesStatus
+        CHECK ((Status = 'Pending' AND AiOutcome IS NULL)
+            OR (Status = 'Graded' AND AiOutcome = 'Accepted')
+            OR (Status = 'NotGraded' AND AiOutcome IN ('Declined', 'Failed'))),
     CONSTRAINT CK_QuizAttemptEssayAnswers_AiConfidence
         CHECK (AiConfidence IS NULL OR AiConfidence BETWEEN 0 AND 1)
 );
 GO
 
 CREATE INDEX IX_QuizAttemptEssayAnswers_QuestionId ON Assessment.QuizAttemptEssayAnswers (QuestionId);
--- What is waiting for a grader.
+-- Essays whose grade is not final yet (still waiting for the AI).
 CREATE INDEX IX_QuizAttemptEssayAnswers_Status
     ON Assessment.QuizAttemptEssayAnswers (Status)
     WHERE Status = N'Pending';
@@ -536,6 +565,14 @@ CREATE TABLE Assessment.QuestionHints
     CONSTRAINT CK_QuestionHints_AttemptNumber
         CHECK (AttemptNumber IS NULL OR AttemptNumber BETWEEN 1 AND 5)
 );
+GO
+
+-- Each Hint-button level is saved once per attempt and question, in ANY language.
+-- The sequence key above is per language, so on its own it let two presses at
+-- the same moment both keep level 1. Filtered: post-submission hints have no level.
+CREATE UNIQUE INDEX UQ_QuestionHints_AttemptId_QuestionId_AttemptNumber
+    ON Assessment.QuestionHints (QuizAttemptId, QuestionId, AttemptNumber)
+    WHERE AttemptNumber IS NOT NULL;
 GO
 
 

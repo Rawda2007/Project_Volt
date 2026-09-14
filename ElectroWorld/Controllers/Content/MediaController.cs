@@ -4,6 +4,7 @@ using ElectroWorld.Swagger;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Shared.Common.Api;
+using Shared.Common.Exceptions;
 
 namespace ElectroWorld.Controllers.Content;
 
@@ -30,7 +31,10 @@ public class MediaController : ControllerBase
             var url = await _imageStorageService.SaveImageAsync(file, ct);
             return Ok(ApiResponse<ImageUploadResponse>.Ok(new ImageUploadResponse(url), "تم رفع الصورة بنجاح"));
         }
-        catch (InvalidOperationException ex)
+        // Only the upload's business rules (empty, too large, wrong extension).
+        // Anything else — e.g. wwwroot not configured — must stay a 500 from
+        // ExceptionMiddleware instead of echoing an internal message.
+        catch (BusinessRuleException ex)
         {
             return BadRequest(ApiResponse<ImageUploadResponse>.Fail(ex.Message));
         }

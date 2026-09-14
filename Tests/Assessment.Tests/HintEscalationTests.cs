@@ -1,5 +1,6 @@
 using AssessmentBL;
 using AssessmentBL.Services;
+using AssessmentBL.Services.Constants;
 using AssessmentDA.Context;
 using AssessmentDA.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -68,6 +69,35 @@ public class HintEscalationSettingsTests
         => Assert.Equal(0.5m, new AssessmentSettings { HintSimilarityThreshold = 0.1m }.EffectiveHintSimilarityThreshold);
 }
 
+/// <summary>
+/// Only a hint the child is shown uses a level: a Partial or Unavailable press is
+/// not counted against them.
+/// </summary>
+public class HintsRemainingTests
+{
+    [Theory]
+    [InlineData(1, 1)]   // first level shown: one left
+    [InlineData(2, 0)]   // second level shown: the button can be disabled
+    public void AGeneratedHint_UsesItsLevel(byte attemptNumber, int remaining)
+        => Assert.Equal(remaining, HintService.HintsRemaining(2, attemptNumber, HintStatuses.Generated));
+
+    [Theory]
+    [InlineData(HintStatuses.Partial)]
+    [InlineData(HintStatuses.Unavailable)]
+    public void APressWithNoHintShown_IsNotCounted(string status)
+    {
+        // Nothing was used yet, and nothing is used now.
+        Assert.Equal(2, HintService.HintsRemaining(2, 1, status));
+
+        // One level already shown; this press for level 2 leaves it available.
+        Assert.Equal(1, HintService.HintsRemaining(2, 2, status));
+    }
+
+    [Fact]
+    public void HintsRemaining_NeverGoesBelowZero()
+        => Assert.Equal(0, HintService.HintsRemaining(1, 3, HintStatuses.Generated));
+}
+
 public class HintModelTests
 {
     private static AssessmentDbContext CreateContext()
@@ -100,8 +130,9 @@ public class HintModelTests
 
         var index = db.Model.FindEntityType(typeof(QuestionHint))!
             .GetIndexes()
-            .Single(i => i.IsUnique);
+            .Single(i => i.Name == "UQ_QuestionHints_AttemptId_QuestionId_Language_Sequence");
 
+        Assert.True(index.IsUnique);
         Assert.Equal(
             new[]
             {
@@ -111,6 +142,31 @@ public class HintModelTests
                 nameof(QuestionHint.HintSequence)
             },
             index.Properties.Select(p => p.Name).ToArray());
+    }
+
+    [Fact]
+    public void EachHintLevel_IsSavedOncePerAttemptAndQuestion_InAnyLanguage()
+    {
+        using var db = CreateContext();
+
+        var index = db.Model.FindEntityType(typeof(QuestionHint))!
+            .GetIndexes()
+            .Single(i => i.Name == "UQ_QuestionHints_AttemptId_QuestionId_AttemptNumber");
+
+        // No LanguageCode and no HintSequence: two presses at the same moment, in
+        // one language or in two, cannot both keep level 1.
+        Assert.True(index.IsUnique);
+        Assert.Equal(
+            new[]
+            {
+                nameof(QuestionHint.QuizAttemptId),
+                nameof(QuestionHint.QuestionId),
+                nameof(QuestionHint.AttemptNumber)
+            },
+            index.Properties.Select(p => p.Name).ToArray());
+
+        // Post-submission hints have no level and are not limited by it.
+        Assert.Equal("[AttemptNumber] IS NOT NULL", index.GetFilter());
     }
 
     [Fact]

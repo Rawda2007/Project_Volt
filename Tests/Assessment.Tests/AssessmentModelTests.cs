@@ -48,14 +48,29 @@ public class AssessmentModelTests
     }
 
     [Fact]
-    public void QuizAttemptQuestion_ClassificationSnapshotIsAlwaysRequired()
+    public void AQuestion_MayBelongToNoTopic()
+    {
+        using var db = CreateContext();
+
+        var question = db.Model.FindEntityType(typeof(Question))!;
+
+        Assert.True(question.FindProperty(nameof(Question.TopicId))!.IsNullable);
+        Assert.False(question.GetForeignKeys()
+            .Single(fk => fk.GetConstraintName() == "FK_Questions_Topics").IsRequired);
+    }
+
+    [Fact]
+    public void QuizAttemptQuestion_ClassificationSnapshot_FreezesTheTopicEvenWhenThereIsNone()
     {
         using var db = CreateContext();
 
         var entity = db.Model.FindEntityType(typeof(QuizAttemptQuestion))!;
 
-        // Topic and difficulty are frozen for every question type.
-        Assert.False(entity.FindProperty(nameof(QuizAttemptQuestion.TopicId))!.IsNullable);
+        // The topic is frozen as it was — including "no topic" — and difficulty is
+        // always there.
+        Assert.True(entity.FindProperty(nameof(QuizAttemptQuestion.TopicId))!.IsNullable);
+        Assert.False(entity.GetForeignKeys()
+            .Single(fk => fk.GetConstraintName() == "FK_QuizAttemptQuestions_Topics").IsRequired);
         Assert.False(entity.FindProperty(nameof(QuizAttemptQuestion.Difficulty))!.IsNullable);
 
         // CorrectOptionId became nullable when Essay support landed — an Essay has
@@ -155,14 +170,17 @@ public class QuestionTypeAndLocalizationModelTests
         var index = db.Model
             .FindEntityType(typeof(QuestionHint))!
             .GetIndexes()
-            .Single(i => i.IsUnique);
+            .Single(i => i.Name == "UQ_QuestionHints_AttemptId_QuestionId_Language_Sequence");
 
-        // Without LanguageCode in the key, an Arabic and an English hint could not
-        // both be sequence 1 for the same mistake.
+        // Mirrors UQ_QuestionHints_AttemptId_QuestionId_Language_Sequence in
+        // 000_AssessmentSchema.sql: one chain per attempt + question + language,
+        // because a Hint-button hint has no mistake to key on. Without LanguageCode
+        // an Arabic and an English hint could not both be sequence 1.
         Assert.Equal(
             new[]
             {
-                nameof(QuestionHint.QuizAttemptMistakeId),
+                nameof(QuestionHint.QuizAttemptId),
+                nameof(QuestionHint.QuestionId),
                 nameof(QuestionHint.LanguageCode),
                 nameof(QuestionHint.HintSequence)
             },

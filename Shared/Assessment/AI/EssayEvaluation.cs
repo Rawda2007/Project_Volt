@@ -1,9 +1,10 @@
 namespace Shared.Assessment.AI;
 
 /// <summary>
-/// Essay answers to evaluate. The AI proposes a score and feedback; the backend
-/// decides whether that proposal becomes the grade. Carries no user, attempt or
-/// account identifier of any kind.
+/// Essay answers to evaluate. The AI grades each one — points and feedback —
+/// and the backend only checks that the grade is well-formed before storing it.
+/// Essays have no model answer and no rubric: the AI judges the answer against
+/// the question alone. Carries no user, attempt or account identifier of any kind.
 /// </summary>
 public sealed class EssayEvaluationRequest
 {
@@ -33,9 +34,13 @@ public sealed class EssayRequestItem
 
     public string? Topic { get; init; }
 
+    /// <summary>
+    /// The question text and, when it has an image, the image's description —
+    /// the AI does not look at the image itself unless its bytes are sent.
+    /// </summary>
     public AiQuestion Question { get; init; } = new();
 
-    /// <summary>The most the answer can earn. A proposal above it is rejected.</summary>
+    /// <summary>The most the answer can earn. Points above it are not accepted.</summary>
     public int MaxPoints { get; init; }
 
     public EssayStudentAnswer StudentAnswer { get; init; } = new();
@@ -59,23 +64,26 @@ public sealed class EssayEvaluationResult
 {
     public string? ItemId { get; init; }
 
-    /// <summary>Ok | Skipped (the AI declined — a person grades it). Missing = Ok.</summary>
+    /// <summary>
+    /// Ok | Skipped. Missing = Ok. Skipped means the AI will not grade this
+    /// answer; it is final — the essay earns no points and nobody else grades it.
+    /// </summary>
     public string? Status { get; init; }
 
-    /// <summary>0 … MaxPoints.</summary>
-    public int? ProposedPoints { get; init; }
+    /// <summary>The grade: a whole number, 0 … MaxPoints. Required when Ok.</summary>
+    public int? Points { get; init; }
 
-    /// <summary>Child-facing feedback, in the request language.</summary>
+    /// <summary>Child-facing feedback, in the request language. Required when Ok.</summary>
     public string? Feedback { get; init; }
 
-    /// <summary>0.00 … 1.00.</summary>
+    /// <summary>
+    /// Optional, 0.00 … 1.00. Stored for monitoring only: it never decides
+    /// whether the grade is accepted.
+    /// </summary>
     public decimal? Confidence { get; init; }
 
-    /// <summary>
-    /// Anything a person should look at: "OffTopic", "Unsafe", "PersonalData",
-    /// "Unclear"… Any flag sends the answer to review instead of auto-grading.
-    /// </summary>
-    public IReadOnlyList<string>? Flags { get; init; }
+    /// <summary>Optional. Why the item was Skipped, for logs only; never shown to the child.</summary>
+    public string? Reason { get; init; }
 }
 
 public interface IAiEssayEvaluator

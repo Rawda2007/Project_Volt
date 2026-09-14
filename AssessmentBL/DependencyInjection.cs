@@ -26,6 +26,8 @@ namespace AssessmentBL
             services.AddScoped<IEssayEvaluationService, EssayEvaluationService>();
             services.AddScoped<IHintService, HintService>();
             services.AddScoped<IPlacementService, PlacementService>();
+            services.AddScoped<ICategoryService, CategoryService>();
+            services.AddScoped<ITopicService, TopicService>();
 
             return services;
         }

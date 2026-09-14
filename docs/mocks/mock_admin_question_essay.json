@@ -5,6 +5,7 @@
   "questionText": "اشرح بأسلوبك لماذا يضيء المصباح عند غلق الدائرة الكهربية.",
   "questionType": "Essay",
   "imageUrl": null,
+  "imageDescription": null,
   "difficulty": "Hard",
   "displayOrder": 4,
   "points": 3,

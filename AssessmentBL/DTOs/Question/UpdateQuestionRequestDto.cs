@@ -2,7 +2,11 @@
 {
     public class UpdateQuestionDto
     {
-        public int TopicId { get; set; }
+        /// <summary>
+        /// Optional. Null (or omitted) removes the question from its topic: PUT
+        /// replaces the whole question. A new value must be an existing topic.
+        /// </summary>
+        public int? TopicId { get; set; }
 
         public string QuestionText { get; set; } = null!;
 
@@ -12,8 +16,10 @@
         public string? ImageUrl { get; set; }
 
         /// <summary>
-        /// Admin-only semantic description of the image, for the AI. NEVER
-        /// returned to the child.
+        /// Admin-only semantic description of the image, for the AI, which never
+        /// looks at the image itself. REQUIRED (non-blank, at most 1000
+        /// characters) when ImageUrl is supplied; cleared when the image is
+        /// removed. NEVER returned to the child.
         /// </summary>
         public string? ImageDescription { get; set; }
 

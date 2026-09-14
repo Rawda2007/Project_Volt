@@ -11,14 +11,20 @@ public class QuizAttemptEssayAnswerConfiguration : IEntityTypeConfiguration<Quiz
         entity.ToTable("QuizAttemptEssayAnswers", "Assessment", tb =>
         {
             tb.HasCheckConstraint("CK_QuizAttemptEssayAnswers_Status",
-                "[Status] IN ('Pending', 'Graded', 'Skipped')");
+                "[Status] IN ('Pending', 'Graded', 'NotGraded')");
+            // The AI is the only grader.
             tb.HasCheckConstraint("CK_QuizAttemptEssayAnswers_GradedBy",
-                "[GradedBy] IS NULL OR [GradedBy] IN ('Human', 'Ai')");
+                "[GradedBy] IS NULL OR [GradedBy] = 'Ai'");
             tb.HasCheckConstraint("CK_QuizAttemptEssayAnswers_GradedIsComplete",
                 "([Status] = 'Graded' AND [AwardedPoints] IS NOT NULL AND [GradedAt] IS NOT NULL AND [GradedBy] IS NOT NULL) "
               + "OR ([Status] <> 'Graded' AND [AwardedPoints] IS NULL AND [GradedAt] IS NULL AND [GradedBy] IS NULL)");
             tb.HasCheckConstraint("CK_QuizAttemptEssayAnswers_AiOutcome",
-                "[AiOutcome] IS NULL OR [AiOutcome] IN ('Accepted', 'NeedsReview', 'Failed')");
+                "[AiOutcome] IS NULL OR [AiOutcome] IN ('Accepted', 'Declined', 'Failed')");
+            // Pending has no outcome yet; a final status always says how it ended.
+            tb.HasCheckConstraint("CK_QuizAttemptEssayAnswers_OutcomeMatchesStatus",
+                "([Status] = 'Pending' AND [AiOutcome] IS NULL) "
+              + "OR ([Status] = 'Graded' AND [AiOutcome] = 'Accepted') "
+              + "OR ([Status] = 'NotGraded' AND [AiOutcome] IN ('Declined', 'Failed'))");
             tb.HasCheckConstraint("CK_QuizAttemptEssayAnswers_AiConfidence",
                 "[AiConfidence] IS NULL OR [AiConfidence] BETWEEN 0 AND 1");
             tb.HasCheckConstraint("CK_QuizAttemptEssayAnswers_AwardedWithinMax",

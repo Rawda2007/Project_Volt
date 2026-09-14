@@ -1,4 +1,5 @@
 {
-  "statusCode": 400,
-  "message": "إجابة السؤال رقم 104 فارغة"
+  "success": false,
+  "message": "إجابة السؤال رقم 104 فارغة",
+  "data": null
 }

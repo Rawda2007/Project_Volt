@@ -1,4 +1,4 @@
-﻿using AssessmentBL.DTOs.Placement;
+using AssessmentBL.DTOs.Placement;
 
 namespace AssessmentBL.DTOs.QuizAttempt
 {
@@ -17,14 +17,14 @@ namespace AssessmentBL.DTOs.QuizAttempt
         public short TotalQuestions { get; set; }
 
         /// <summary>
-        /// Questions the backend could score by itself — total minus essays.
-        /// This is the denominator of ScorePercentage.
+        /// Questions the backend could score by itself: total minus essays.
+        /// Their Points are the denominator of ScorePercentage.
         /// </summary>
         public short AutoGradedQuestions { get; set; }
 
         /// <summary>
-        /// Essay answers not graded yet (waiting for the AI or a person). Essays are
-        /// never part of ScorePercentage; their grades are in EssayResults.
+        /// Essay answers the AI has not finished with yet. Essays are never part of
+        /// ScorePercentage; their grades are in EssayResults.
         /// </summary>
         public short PendingEssayQuestions { get; set; }
 
@@ -35,8 +35,27 @@ namespace AssessmentBL.DTOs.QuizAttempt
 
         public short WrongAnswers { get; set; }
 
-        /// <summary>correct / AutoGradedQuestions, 2dp. 0 when nothing was auto-graded.</summary>
+        /// <summary>
+        /// Points of the correct MultipleChoice/TrueFalse answers ÷ Points of all
+        /// MultipleChoice/TrueFalse questions × 100, 2dp. Each question weighs its
+        /// Points (1 unless the admin set another value), frozen when the attempt
+        /// started. Essays are never part of it: this is final at submit, while
+        /// essays are graded by the AI afterwards. 0 when nothing was auto-graded.
+        /// </summary>
         public decimal ScorePercentage { get; set; }
+
+        /// <summary>Sum of the Points of every question in the attempt, essays included.</summary>
+        public int TotalPoints { get; set; }
+
+        /// <summary>
+        /// Points earned so far: the correct MultipleChoice/TrueFalse answers plus
+        /// the AwardedPoints of Graded essays. Can still grow while
+        /// PendingEssayQuestions is above 0; final once it is 0.
+        /// </summary>
+        public int EarnedPoints { get; set; }
+
+        /// <summary>MaxPoints of the essays still Pending: points not decided yet.</summary>
+        public int PendingPoints { get; set; }
 
         public string Language { get; set; } = null!;
 

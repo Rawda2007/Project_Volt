@@ -11,7 +11,7 @@ namespace Assessment.Tests;
 
 /// <summary>
 /// Captures the ACTUAL wire contract of the AI integration (HttpExternalAiProvider,
-/// docs/AI_CONTRACT.md v1) without contacting any external service, and pins each
+/// docs/AI_CONTRACT.md v2) without contacting any external service, and pins each
 /// documented failure mode to the exception the code really throws.
 /// </summary>
 public class AiProviderContractTests
@@ -106,7 +106,7 @@ public class AiProviderContractTests
     // ---------------------------------------------------------------- hints
 
     [Fact]
-    public async Task HintRequest_IsCamelCaseV1_WithTheFullQuestionAndTheReference()
+    public async Task HintRequest_IsCamelCaseV2_WithTheFullQuestionAndTheReference()
     {
         var (provider, handler) = Build(_ => Json(HttpStatusCode.OK,
             """{"results":[{"questionId":101,"status":"Ok","hint":"تلميح"}]}"""));
@@ -121,7 +121,7 @@ public class AiProviderContractTests
         var body = JsonDocument.Parse(handler.Body!).RootElement;
         var item = body.GetProperty("items")[0];
 
-        Assert.Equal("1", body.GetProperty("contractVersion").GetString());
+        Assert.Equal("2", body.GetProperty("contractVersion").GetString());
         Assert.Equal("ar", body.GetProperty("language").GetString());
         Assert.Equal("MultipleChoice", item.GetProperty("questionType").GetString());
         Assert.Equal(2, item.GetProperty("options").GetArrayLength());
@@ -183,23 +183,87 @@ public class AiProviderContractTests
     // ---------------------------------------------------------------- essays
 
     [Fact]
-    public async Task EssayRequest_IsCamelCaseV1_WithAnOpaqueItemKey()
+    public async Task EssayRequest_IsCamelCaseV2_WithAnOpaqueItemKey()
     {
         var (provider, handler) = Build(_ => Json(HttpStatusCode.OK,
-            """{"results":[{"itemId":"1","status":"Ok","proposedPoints":2,"feedback":"أحسنت","confidence":0.9,"flags":[]}]}"""));
+            """{"results":[{"itemId":"1","status":"Ok","points":2,"feedback":"أحسنت","confidence":0.9}]}"""));
 
         var response = await provider.EvaluateEssaysAsync(SampleEssayRequest());
 
         Assert.Equal("https://ai.example.internal/v1/essays", handler.Request!.RequestUri!.ToString());
 
-        var item = JsonDocument.Parse(handler.Body!).RootElement.GetProperty("items")[0];
+        var body = JsonDocument.Parse(handler.Body!).RootElement;
+        Assert.Equal("2", body.GetProperty("contractVersion").GetString());
+        Assert.Equal("EssayEvaluation", body.GetProperty("task").GetString());
+        Assert.Equal("ar", body.GetProperty("language").GetString());
+
+        var item = body.GetProperty("items")[0];
         Assert.Equal("1", item.GetProperty("itemId").GetString());
         Assert.Equal(3, item.GetProperty("maxPoints").GetInt32());
+        Assert.Equal("Medium", item.GetProperty("difficulty").GetString());
+        Assert.False(string.IsNullOrWhiteSpace(item.GetProperty("question").GetProperty("text").GetString()));
         Assert.False(string.IsNullOrWhiteSpace(item.GetProperty("studentAnswer").GetProperty("text").GetString()));
 
+        // Essays have no model answer or rubric to send.
+        foreach (var absent in new[] { "modelAnswer", "rubric", "reference", "correct" })
+            Assert.DoesNotContain(absent, handler.Body!, StringComparison.OrdinalIgnoreCase);
+
         var result = Assert.Single(response.Results);
-        Assert.Equal(2, result.ProposedPoints);
+        Assert.Equal("1", result.ItemId);
+        Assert.Equal(2, result.Points);
+        Assert.Equal("أحسنت", result.Feedback);
         Assert.Equal(0.9m, result.Confidence);
+        Assert.Null(result.Reason);
+    }
+
+    [Fact]
+    public async Task EssayResponse_ASkippedItem_CarriesItsReason_AndConfidenceMayBeOmitted()
+    {
+        var (provider, _) = Build(_ => Json(HttpStatusCode.OK,
+            """{"contractVersion":"2","results":[{"itemId":"1","status":"Skipped","reason":"The answer is not about the question."},{"itemId":"2","points":1,"feedback":"جيد"}]}"""));
+
+        var response = await provider.EvaluateEssaysAsync(SampleEssayRequest());
+
+        Assert.Equal("2", response.ContractVersion);
+        Assert.Collection(response.Results,
+            skipped =>
+            {
+                Assert.Equal("Skipped", skipped.Status);
+                Assert.Equal("The answer is not about the question.", skipped.Reason);
+                Assert.Null(skipped.Points);
+                Assert.Null(skipped.Confidence);
+            },
+            graded =>
+            {
+                Assert.Null(graded.Status);          // missing = Ok
+                Assert.Equal(1, graded.Points);
+                Assert.Null(graded.Confidence);      // optional
+            });
+    }
+
+    [Fact]
+    public async Task EssayResponse_V1FieldNames_AreNotReadAsAGrade()
+    {
+        // "proposedPoints" and "flags" are gone: a v1-shaped result has no points,
+        // so the service retries it instead of misreading it.
+        var (provider, _) = Build(_ => Json(HttpStatusCode.OK,
+            """{"results":[{"itemId":"1","status":"Ok","proposedPoints":2,"feedback":"أحسنت","confidence":0.9,"flags":["Unclear"]}]}"""));
+
+        var result = Assert.Single((await provider.EvaluateEssaysAsync(SampleEssayRequest())).Results);
+
+        Assert.Null(result.Points);
+    }
+
+    [Fact]
+    public void EssayResult_WireShape_IsPinned()
+    {
+        var json = JsonSerializer.Serialize(
+            new EssayEvaluationResult { ItemId = "1", Status = "Ok", Points = 2, Feedback = "f", Confidence = 0.5m, Reason = "r" },
+            new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        var names = JsonDocument.Parse(json).RootElement.EnumerateObject().Select(p => p.Name).ToArray();
+
+        Assert.Equal(new[] { "itemId", "status", "points", "feedback", "confidence", "reason" }, names);
     }
 
     [Fact]

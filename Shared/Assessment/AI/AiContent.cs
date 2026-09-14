@@ -1,9 +1,14 @@
 namespace Shared.Assessment.AI;
 
-/// <summary>The Assessment ↔ AI wire contract version. See docs/AI_CONTRACT.md.</summary>
+/// <summary>
+/// The Assessment ↔ AI wire contract version. See docs/AI_CONTRACT.md.
+/// 2: the essay result carries "points" (was "proposedPoints") and an optional
+/// "reason"; "flags" is gone and "confidence" is optional — the AI's grade is
+/// final once it is well-formed, with no review by a person.
+/// </summary>
 public static class AiContract
 {
-    public const string Version = "1";
+    public const string Version = "2";
 }
 
 /// <summary>Per-item status an AI response may carry.</summary>

@@ -87,17 +87,17 @@ namespace AssessmentBL.Services
             // LevelAssessment quiz (PlacementEngine). A question added here would
             // never be asked.
             if (quizType == QuizTypes.Placement)
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     "اختبار تحديد المستوى يأخذ أسئلته من اختبارات تقييم المستويات، أضف السؤال إلى اختبار تقييم المستوى المناسب");
 
-            var topicExists = await _db.Topics.AsNoTracking().AnyAsync(t => t.Id == request.TopicId, cancellationToken: cancellationToken);
-            if (!topicExists)
-                throw new KeyNotFoundException($"الموضوع رقم {request.TopicId} غير موجود");
+            if (request.TopicId is int topicId)
+                await EnsureTopicExistsAsync(topicId, cancellationToken);
 
             var questionText = NormalizeQuestionText(request.QuestionText);
             var difficulty = NormalizeDifficulty(request.Difficulty);
             var questionType = NormalizeQuestionType(request.QuestionType);
             var points = NormalizePoints(request.Points);
+            var (imageUrl, imageDescription) = NormalizeImage(request.ImageUrl, request.ImageDescription);
 
             await EnsureDisplayOrderIsFreeAsync(request.QuizId, request.DisplayOrder, excludingQuestionId: null, cancellationToken: cancellationToken);
 
@@ -107,8 +107,8 @@ namespace AssessmentBL.Services
                 TopicId = request.TopicId,
                 QuestionText = questionText,
                 QuestionType = questionType,
-                ImageUrl = NormalizeImageUrl(request.ImageUrl),
-                ImageDescription = NormalizeImageUrl(request.ImageDescription),
+                ImageUrl = imageUrl,
+                ImageDescription = imageDescription,
                 Difficulty = difficulty,
                 DisplayOrder = request.DisplayOrder,
                 Points = points
@@ -129,12 +129,9 @@ namespace AssessmentBL.Services
             var question = await _db.Questions.FirstOrDefaultAsync(q => q.Id == questionId, cancellationToken: cancellationToken)
                 ?? throw new KeyNotFoundException($"السؤال رقم {questionId} غير موجود");
 
-            if (question.TopicId != request.TopicId)
-            {
-                var topicExists = await _db.Topics.AsNoTracking().AnyAsync(t => t.Id == request.TopicId, cancellationToken: cancellationToken);
-                if (!topicExists)
-                    throw new KeyNotFoundException($"الموضوع رقم {request.TopicId} غير موجود");
-            }
+            // Null clears the topic, like every other field PUT replaces.
+            if (request.TopicId is int newTopicId && question.TopicId != newTopicId)
+                await EnsureTopicExistsAsync(newTopicId, cancellationToken);
 
             var questionText = NormalizeQuestionText(request.QuestionText);
             var difficulty = NormalizeDifficulty(request.Difficulty);
@@ -142,21 +139,22 @@ namespace AssessmentBL.Services
                 ? question.QuestionType
                 : NormalizeQuestionType(request.QuestionType);
             var points = NormalizePoints(request.Points);
+            var (imageUrl, imageDescription) = NormalizeImage(request.ImageUrl, request.ImageDescription);
 
             if (question.DisplayOrder != request.DisplayOrder)
                 await EnsureDisplayOrderIsFreeAsync(question.QuizId, request.DisplayOrder, excludingQuestionId: questionId, cancellationToken: cancellationToken);
 
             // Changing type is only safe while the option set still matches the
-            // new type's rules, so validate against the type being saved.
+            // new type's rules, so validate against the type and image being saved.
             if (request.IsActive)
-                await EnsureAnswerableAsync(questionId, questionType, cancellationToken);
+                await EnsureAnswerableAsync(questionId, questionType, imageUrl, imageDescription, cancellationToken);
             // QuizId is not part of UpdateQuestionDto — a question cannot be
             // moved to another quiz, which keeps existing attempt history sane.
             question.TopicId = request.TopicId;
             question.QuestionText = questionText;
             question.QuestionType = questionType;
-            question.ImageUrl = NormalizeImageUrl(request.ImageUrl);
-            question.ImageDescription = NormalizeImageUrl(request.ImageDescription);
+            question.ImageUrl = imageUrl;
+            question.ImageDescription = imageDescription;
             question.Difficulty = difficulty;
             question.DisplayOrder = request.DisplayOrder;
             question.Points = points;
@@ -175,8 +173,11 @@ namespace AssessmentBL.Services
             if (question.IsActive == isActive)
                 return;
 
+            // The stored image is checked, not a request's: this is the path that
+            // catches legacy rows saved before an image required a description.
             if (isActive)
-                await EnsureAnswerableAsync(questionId, question.QuestionType, cancellationToken);
+                await EnsureAnswerableAsync(
+                    questionId, question.QuestionType, question.ImageUrl, question.ImageDescription, cancellationToken);
 
             question.IsActive = isActive;
 
@@ -199,6 +200,14 @@ namespace AssessmentBL.Services
             }
         }
 
+        // A topic is optional; when one is given it must exist, or FK_Questions_Topics
+        // would turn the save into a 500.
+        private async Task EnsureTopicExistsAsync(int topicId, CancellationToken cancellationToken)
+        {
+            if (!await _db.Topics.AsNoTracking().AnyAsync(t => t.Id == topicId, cancellationToken))
+                throw new KeyNotFoundException($"الموضوع رقم {topicId} غير موجود");
+        }
+
         // Mirrors UQ_Questions_QuizId_DisplayOrder so the admin gets a clear
         // conflict instead of a raw unique-index violation.
         private async Task EnsureDisplayOrderIsFreeAsync(int quizId, short displayOrder, int? excludingQuestionId, CancellationToken cancellationToken = default)
@@ -210,7 +219,7 @@ namespace AssessmentBL.Services
                             && (excludingQuestionId == null || q.Id != excludingQuestionId.Value), cancellationToken: cancellationToken);
 
             if (taken)
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     $"الترتيب {displayOrder} مستخدم بالفعل في الاختبار رقم {quizId}");
         }
 
@@ -249,15 +258,52 @@ namespace AssessmentBL.Services
         private static string? NormalizeImageUrl(string? imageUrl) =>
             string.IsNullOrWhiteSpace(imageUrl) ? null : imageUrl.Trim();
 
+        // Mirrors the NVARCHAR(1000) ImageDescription column.
+        private const int MaxImageDescriptionLength = 1000;
+
+        /// <summary>
+        /// Mirrors CK_Questions_ImageHasDescription. The AI never looks at images,
+        /// only at text, so an image is only usable with a description of what it
+        /// shows. Without an image the description is dropped: a description must
+        /// never outlive a removed image and describe something that is not there.
+        /// </summary>
+        private static (string? ImageUrl, string? ImageDescription) NormalizeImage(
+            string? imageUrl, string? imageDescription)
+        {
+            var image = NormalizeImageUrl(imageUrl);
+            if (image is null)
+                return (null, null);
+
+            if (string.IsNullOrWhiteSpace(imageDescription))
+                throw new ArgumentException(
+                    "السؤال الذي يحتوي على صورة يجب أن يحتوي على وصف للصورة حتى يتمكن النظام من فهم السؤال",
+                    nameof(imageDescription));
+
+            var description = imageDescription.Trim();
+            if (description.Length > MaxImageDescriptionLength)
+                throw new ArgumentException(
+                    $"وصف الصورة لا يتجاوز {MaxImageDescriptionLength} حرف", nameof(imageDescription));
+
+            return (image, description);
+        }
+
         /// <summary>
         /// A question may only be activated when its options match its type:
         /// MultipleChoice needs at least two options and exactly one correct,
         /// TrueFalse needs exactly two options and exactly one correct, and an
-        /// Essay must have none at all.
+        /// Essay must have none at all. Every image — the question's own and each
+        /// option's — must also carry a description, because a published question
+        /// is what the AI is asked about.
         /// </summary>
         private async Task EnsureAnswerableAsync(
-            int questionId, string questionType, CancellationToken cancellationToken = default)
+            int questionId,
+            string questionType,
+            string? imageUrl,
+            string? imageDescription,
+            CancellationToken cancellationToken = default)
         {
+            EnsureQuestionImageIsDescribed(questionId, imageUrl, imageDescription);
+
             var counts = await _db.QuestionOptions
                 .AsNoTracking()
                 .Where(o => o.QuestionId == questionId)
@@ -271,23 +317,57 @@ namespace AssessmentBL.Services
             if (questionType == QuestionTypes.Essay)
             {
                 if (total > 0)
-                    throw new InvalidOperationException(
+                    throw new BusinessRuleException(
                         $"السؤال المقالي رقم {questionId} لا يجب أن يحتوي على اختيارات");
 
                 return;
             }
 
             if (questionType == QuestionTypes.TrueFalse && total != 2)
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     $"سؤال الصح والخطأ رقم {questionId} يجب أن يحتوي على اختيارين بالضبط");
 
             if (questionType == QuestionTypes.MultipleChoice && total < 2)
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     $"السؤال رقم {questionId} يجب أن يحتوي على اختيارين على الأقل قبل تفعيله");
 
             if (correct != 1)
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     $"السؤال رقم {questionId} يجب أن يحتوي على إجابة صحيحة واحدة بالضبط قبل تفعيله");
+
+            // Same test as CK_QuestionOptions_ImageHasDescription (ImageUrl IS NOT
+            // NULL, trimmed description blank). Options saved through
+            // QuestionOptionService always pass; this catches rows written before
+            // the rule existed, which the migration left in place WITH NOCHECK.
+            var undescribedOptionIds = await _db.QuestionOptions
+                .AsNoTracking()
+                .Where(o => o.QuestionId == questionId
+                         && o.ImageUrl != null
+                         && (o.ImageDescription == null || o.ImageDescription.Trim() == ""))
+                .OrderBy(o => o.DisplayOrder)
+                .Select(o => o.Id)
+                .ToListAsync(cancellationToken);
+
+            EnsureOptionImagesAreDescribed(questionId, undescribedOptionIds);
+        }
+
+        // Uses the database's notion of "has an image" (ImageUrl not null), not the
+        // request normalizer's, so a legacy blank ImageUrl is refused here with a
+        // clear message instead of failing CK_Questions_ImageHasDescription later.
+        private static void EnsureQuestionImageIsDescribed(
+            int questionId, string? imageUrl, string? imageDescription)
+        {
+            if (imageUrl is not null && string.IsNullOrWhiteSpace(imageDescription))
+                throw new BusinessRuleException(
+                    $"لا يمكن تفعيل السؤال رقم {questionId}: صورة السؤال بدون وصف، أضف وصفًا للصورة أولًا");
+        }
+
+        private static void EnsureOptionImagesAreDescribed(
+            int questionId, IReadOnlyCollection<int> undescribedOptionIds)
+        {
+            if (undescribedOptionIds.Count > 0)
+                throw new BusinessRuleException(
+                    $"لا يمكن تفعيل السؤال رقم {questionId}: صور الاختيارات رقم {string.Join("، ", undescribedOptionIds)} بدون وصف، أضف وصفًا لكل صورة أولًا");
         }
 
         // Mirrors CK_Questions_Points (> 0); 0 means "not supplied", so the

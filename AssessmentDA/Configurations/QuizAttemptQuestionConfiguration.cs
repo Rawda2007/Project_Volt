@@ -20,6 +20,8 @@ public class QuizAttemptQuestionConfiguration : IEntityTypeConfiguration<QuizAtt
             tb.HasCheckConstraint("CK_QuizAttemptQuestions_EssayHasNoKey",
                 "([QuestionType] = 'Essay' AND [CorrectOptionId] IS NULL) "
               + "OR ([QuestionType] <> 'Essay' AND [CorrectOptionId] IS NOT NULL)");
+            // Same rule as CK_Questions_Points: a question weighs at least 1.
+            tb.HasCheckConstraint("CK_QuizAttemptQuestions_Points", "[Points] > 0");
         });
 
         entity.HasIndex(e => new { e.QuizAttemptId, e.QuestionId }, "UQ_QuizAttemptQuestions_AttemptId_QuestionId")
@@ -31,6 +33,7 @@ public class QuizAttemptQuestionConfiguration : IEntityTypeConfiguration<QuizAtt
         entity.Property(e => e.QuestionType)
             .HasMaxLength(20)
             .HasDefaultValue("MultipleChoice");
+        entity.Property(e => e.Points).HasDefaultValue((byte)1);
 
         entity.Property(e => e.CreatedAt)
             .HasPrecision(3)
@@ -52,8 +55,10 @@ public class QuizAttemptQuestionConfiguration : IEntityTypeConfiguration<QuizAtt
 
         // DB: no ON DELETE clause (NO ACTION) — the historical topic a past
         // attempt was classified under cannot be deleted out from under it.
+        // NULL when the question had no topic at attempt start.
         entity.HasOne(d => d.Topic).WithMany()
             .HasForeignKey(d => d.TopicId)
+            .IsRequired(false)
             .OnDelete(DeleteBehavior.Restrict)
             .HasConstraintName("FK_QuizAttemptQuestions_Topics");
 

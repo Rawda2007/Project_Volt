@@ -12,22 +12,28 @@ using Shared.Common.Abstractions;
 namespace AssessmentBL.Services
 {
     /// <summary>
-    /// AI evaluation of essay answers. The AI sees the question and the child's
-    /// answer and PROPOSES a score and feedback; the backend decides
-    /// (<see cref="Decide"/>) whether that proposal becomes the grade or waits for
-    /// a person.
+    /// AI evaluation of essay answers. Essays are graded by the AI only — there is
+    /// no model answer, no rubric and no person reviewing the result. The AI sees
+    /// the question (text and image description) and the child's answer and
+    /// returns points and feedback; the backend only checks that the grade is
+    /// well-formed (<see cref="Decide"/>) before it becomes final.
     ///
     /// Runs twice over, never on the path to the commit: inline right after a
     /// submission commits (inside that submission's AI budget) so the child
     /// usually gets feedback at once, and from EssayEvaluationWorker for anything
     /// that did not finish. Every run first CLAIMS its answers in one UPDATE, so
-    /// two app instances never evaluate the same answer; one AI request carries
-    /// one attempt — one child — so a child's text can never influence another
-    /// child's evaluation.
+    /// two app instances never evaluate the same answer, and writes a decision only
+    /// while it still holds that claim on a Pending answer, so a final status is
+    /// never overwritten. One AI request carries one attempt — one child — so a
+    /// child's text can never influence another child's evaluation.
     /// </summary>
     public sealed class EssayEvaluationService : IEssayEvaluationService
     {
         private const int BatchSize = 20;
+
+        // The AI's decline reason is free text that may quote the child's answer:
+        // only a bounded prefix reaches the logs.
+        private const int MaxLoggedReasonLength = 200;
 
         private readonly AssessmentDbContext _db;
         private readonly IAiEssayEvaluator _evaluator;
@@ -68,8 +74,10 @@ namespace AssessmentBL.Services
                 .Select(e => e.Id)
                 .ToListAsync(cancellationToken);
 
+            // Inline, the submission's budget bounds everything, including a request
+            // already under way: what it cuts short is not the AI's failure.
             if (candidateIds.Count > 0)
-                await ClaimAndEvaluateAsync(candidateIds, cancellationToken);
+                await ClaimAndEvaluateAsync(candidateIds, cancellationToken, cancellationToken);
         }
 
         public async Task<int> EvaluateDueAsync(CancellationToken cancellationToken)
@@ -81,14 +89,26 @@ namespace AssessmentBL.Services
             var maxAttempts = _settings.EffectiveEssayEvaluationMaxAttempts;
             var settledBefore = now - _settings.EssayInlineGrace;
             var retryMinutes = (int)_settings.EssayEvaluationRetryDelay.TotalMinutes;
+            var claimsStaleBefore = now - _settings.EssayClaimLifetime;
 
-            // Answers that used up their attempts under an older, higher limit would
-            // otherwise sit unclaimed forever: close them.
+            // Answers that used up their attempts but are still Pending (a run died
+            // after claiming the last one, or the limit was lowered) would otherwise
+            // sit unclaimed forever: close them. Only once the last claim is older
+            // than any live run can hold one — an answer on its last attempt may
+            // still be with the AI, and closing it would throw that grade away.
+            // (If a run does outlive the bound, SaveDecisionAsync still refuses to
+            // overwrite what is closed here.) Status and outcome change together —
+            // CK_QuizAttemptEssayAnswers_OutcomeMatchesStatus allows no Pending row
+            // with an outcome.
             await _db.QuizAttemptEssayAnswers
                 .Where(e => e.Status == EssayAnswerStatuses.Pending
                          && e.AiOutcome == null
-                         && e.AiEvaluationAttempts >= maxAttempts)
-                .ExecuteUpdateAsync(s => s.SetProperty(e => e.AiOutcome, EssayAiOutcomes.Failed), cancellationToken);
+                         && e.AiEvaluationAttempts >= maxAttempts
+                         && (e.AiLastAttemptAt == null || e.AiLastAttemptAt <= claimsStaleBefore))
+                .ExecuteUpdateAsync(s => s
+                        .SetProperty(e => e.Status, EssayAnswerStatuses.NotGraded)
+                        .SetProperty(e => e.AiOutcome, EssayAiOutcomes.Failed),
+                    cancellationToken);
 
             // Served by IX_QuizAttemptEssayAnswers_AiDue. The retry wait grows with
             // each attempt: 10, 20, 30… minutes.
@@ -108,15 +128,27 @@ namespace AssessmentBL.Services
             if (candidateIds.Count == 0)
                 return 0;
 
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(_settings.EssayEvaluationTimeout);
+            // The batch deadline only stops NEW requests from starting. A request
+            // that has started gets its own full EssayEvaluationTimeout, bounded
+            // otherwise only by host shutdown, so a slow attempt early in the batch
+            // cannot cut the next one short and cost it an attempt.
+            using var batchDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            batchDeadline.CancelAfter(_settings.EssayEvaluationTimeout);
 
-            return await ClaimAndEvaluateAsync(candidateIds, timeout.Token);
+            return await ClaimAndEvaluateAsync(candidateIds, batchDeadline.Token, cancellationToken);
         }
 
-        private async Task<int> ClaimAndEvaluateAsync(List<long> candidateIds, CancellationToken cancellationToken)
+        /// <param name="startBudget">Once cancelled, no further attempt's request starts.</param>
+        /// <param name="runBudget">
+        /// Cancelling it abandons even a request under way, with the attempt uncounted:
+        /// the caller ran out of time, the AI did not fail.
+        /// </param>
+        private async Task<int> ClaimAndEvaluateAsync(
+            List<long> candidateIds,
+            CancellationToken startBudget,
+            CancellationToken runBudget)
         {
-            if (cancellationToken.IsCancellationRequested)
+            if (startBudget.IsCancellationRequested)
                 return 0;
 
             var now = _clock.UtcNow;
@@ -143,8 +175,12 @@ namespace AssessmentBL.Services
             if (claimed == 0)
                 return 0;
 
+            // Not tracked: decisions are written by SaveDecisionAsync, never by
+            // SaveChanges. Oldest first, like the candidates.
             var essays = await _db.QuizAttemptEssayAnswers
+                .AsNoTracking()
                 .Where(e => candidateIds.Contains(e.Id) && e.AiClaimId == claimId)
+                .OrderBy(e => e.Id)
                 .ToListAsync(CancellationToken.None);
 
             // One request per attempt: one child's answers, in the language they
@@ -160,15 +196,16 @@ namespace AssessmentBL.Services
             {
                 try
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    decided += await EvaluateAttemptEssaysAsync(byAttempt[i], cancellationToken);
+                    startBudget.ThrowIfCancellationRequested();
+                    decided += await EvaluateAttemptEssaysAsync(byAttempt[i], claimId, runBudget);
                 }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                catch (OperationCanceledException)
+                    when (startBudget.IsCancellationRequested || runBudget.IsCancellationRequested)
                 {
-                    // Out of time before the AI answered — not the AI's failure.
-                    // Hand the unfinished answers back, attempt uncounted.
-                    _db.ChangeTracker.Clear();
-
+                    // The caller's time ran out before this request could start or
+                    // finish — not the AI's failure. Hand the unfinished answers
+                    // back, attempt uncounted. (An AI that is simply too slow is
+                    // counted inside EvaluateAttemptEssaysAsync instead.)
                     await ReleaseAsync(
                         byAttempt.Skip(i).SelectMany(g => g).Select(e => e.Id).ToList(), claimId);
                     break;
@@ -177,10 +214,7 @@ namespace AssessmentBL.Services
                 {
                     // A database hiccup while preparing or saving — not the AI's
                     // failure either. Hand this attempt's answers back and carry on
-                    // with the others; only this group's entities are dropped.
-                    foreach (var essay in byAttempt[i])
-                        _db.Entry(essay).State = EntityState.Detached;
-
+                    // with the others.
                     _logger.LogWarning(ex,
                         "Essay evaluation for attempt {AttemptId} could not complete; its answers are released for the next run.",
                         byAttempt[i][0].QuizAttemptId);
@@ -194,10 +228,18 @@ namespace AssessmentBL.Services
 
         private async Task<int> EvaluateAttemptEssaysAsync(
             List<QuizAttemptEssayAnswer> essays,
-            CancellationToken cancellationToken)
+            Guid claimId,
+            CancellationToken runBudget)
         {
+            // This request's own deadline, preparation included, whatever the batch
+            // has left.
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(runBudget);
+            deadline.CancelAfter(_settings.EssayEvaluationTimeout);
+            var cancellationToken = deadline.Token;
+
             var language = essays[0].LanguageCode;
             var questionIds = essays.Select(e => e.QuestionId).Distinct().ToList();
+            var maxAttempts = _settings.EffectiveEssayEvaluationMaxAttempts;
 
             var rows = (await LocalizedQuestionQuery.Project(
                         _db.Questions.AsNoTracking().Where(q => questionIds.Contains(q.Id)), language)
@@ -207,7 +249,6 @@ namespace AssessmentBL.Services
             var topics = await _aiRequests.LoadTopicNamesAsync(questionIds, language, cancellationToken);
             var imageBudget = _aiRequests.NewImageBudget();
             var now = _clock.UtcNow;
-            var decided = 0;
 
             var items = new List<EssayRequestItem>(essays.Count);
             var awaiting = new Dictionary<string, QuizAttemptEssayAnswer>();
@@ -218,9 +259,13 @@ namespace AssessmentBL.Services
                     || AiRequestBuilder.QuestionSemanticText(row.QuestionText, row.ImageDescription) is null)
                 {
                     // Without the question the AI has nothing to judge the answer
-                    // against; retrying cannot help, so a person grades it.
-                    Apply(essay, EssayDecision.NeedsReview(null, null, null), now);
-                    decided++;
+                    // against, and retrying cannot change that. Nobody else grades
+                    // essays, so it is closed now rather than retried to the limit.
+                    _logger.LogWarning(
+                        "Essay question {QuestionId} has neither text nor an image description; answer {EssayAnswerId} is closed as NotGraded.",
+                        essay.QuestionId, essay.Id);
+
+                    CloseAsNotGraded(essay, EssayAiOutcomes.Failed);
                     continue;
                 }
 
@@ -255,9 +300,19 @@ namespace AssessmentBL.Services
                         new EssayEvaluationRequest { RequestId = Guid.NewGuid(), Language = language, Items = items },
                         cancellationToken);
                 }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (runBudget.IsCancellationRequested)
                 {
-                    throw;   // our deadline, not the AI's failure — the caller releases the claim
+                    throw;   // the caller's time, not the AI's failure — the caller releases the claim
+                }
+                catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+                {
+                    // The AI did not answer within the time one evaluation may take.
+                    // That is a failed attempt like any other, counted: handed back
+                    // uncounted, an essay the AI can never finish in time would stay
+                    // Pending forever instead of ending NotGraded after its attempts.
+                    _logger.LogWarning(
+                        "The AI did not evaluate {Count} essay answer(s) within {Seconds}s; they stay Pending and will be retried.",
+                        awaiting.Count, _settings.EssayEvaluationTimeout.TotalSeconds);
                 }
                 catch (Exception ex)
                 {
@@ -267,6 +322,7 @@ namespace AssessmentBL.Services
                         awaiting.Count);
                 }
 
+                // An item answered twice is ambiguous: neither answer is trusted.
                 var resultsByItem = (response?.Results ?? Array.Empty<EssayEvaluationResult>())
                     .Where(r => r?.ItemId is not null)
                     .GroupBy(r => r.ItemId!)
@@ -275,26 +331,69 @@ namespace AssessmentBL.Services
 
                 foreach (var (itemId, essay) in awaiting)
                 {
+                    var result = resultsByItem.GetValueOrDefault(itemId);
                     var decision = response is null
                         ? EssayDecision.Unusable
-                        : Decide(
-                            resultsByItem.GetValueOrDefault(itemId),
-                            essay.MaxPoints,
-                            _settings.EffectiveEssayAutoAcceptConfidence,
-                            _settings.EffectiveMaxEssayFeedbackLength);
+                        : Decide(result, essay.MaxPoints, _settings.EffectiveMaxEssayFeedbackLength);
 
-                    Apply(essay, decision, now);
+                    if (decision.Kind == EssayDecisionKind.Declined)
+                        _logger.LogInformation(
+                            "The AI declined to grade essay answer {EssayAnswerId}; it is closed as NotGraded. Reason: {Reason}",
+                            essay.Id, ForLog(result?.Reason));
 
-                    if (decision.Kind != EssayDecisionKind.Unusable)
-                        decided++;
+                    Apply(essay, decision, now, maxAttempts);
                 }
             }
 
             // The decision is the valuable part — saved even if the deadline passes
-            // right after the AI answered.
-            await _db.SaveChangesAsync(CancellationToken.None);
+            // right after the AI answered. An essay still Pending needs no write: its
+            // attempt was counted when it was claimed.
+            var decided = 0;
+
+            foreach (var essay in essays.Where(e => e.Status != EssayAnswerStatuses.Pending))
+            {
+                if (await SaveDecisionAsync(essay, claimId) == 1)
+                    decided++;
+                else
+                    _logger.LogInformation(
+                        "Essay answer {EssayAnswerId} was closed or re-claimed by another run while this one evaluated it; this decision is discarded.",
+                        essay.Id);
+            }
 
             return decided;
+        }
+
+        /// <summary>
+        /// Writes a decision only while this run still owns the answer: still
+        /// claimed by it and still Pending. Otherwise another run has closed it
+        /// (e.g. the pre-close of an answer on its last attempt) or re-claimed it,
+        /// and a final status must never change afterwards.
+        /// </summary>
+        private Task<int> SaveDecisionAsync(QuizAttemptEssayAnswer essay, Guid claimId)
+        {
+            var id = essay.Id;
+            var status = essay.Status;
+            var awardedPoints = essay.AwardedPoints;
+            var feedback = essay.Feedback;
+            var gradedBy = essay.GradedBy;
+            var gradedAt = essay.GradedAt;
+            var outcome = essay.AiOutcome;
+            var confidence = essay.AiConfidence;
+
+            return _db.QuizAttemptEssayAnswers
+                .Where(e => e.Id == id
+                         && e.AiClaimId == claimId
+                         && e.Status == EssayAnswerStatuses.Pending
+                         && e.AiOutcome == null)
+                .ExecuteUpdateAsync(s => s
+                        .SetProperty(e => e.Status, status)
+                        .SetProperty(e => e.AwardedPoints, awardedPoints)
+                        .SetProperty(e => e.Feedback, feedback)
+                        .SetProperty(e => e.GradedBy, gradedBy)
+                        .SetProperty(e => e.GradedAt, gradedAt)
+                        .SetProperty(e => e.AiOutcome, outcome)
+                        .SetProperty(e => e.AiConfidence, confidence),
+                    CancellationToken.None);
         }
 
         /// <summary>
@@ -304,24 +403,29 @@ namespace AssessmentBL.Services
         /// </summary>
         private Task<int> ReleaseAsync(List<long> essayIds, Guid claimId) =>
             _db.QuizAttemptEssayAnswers
-                .Where(e => essayIds.Contains(e.Id) && e.AiClaimId == claimId && e.AiOutcome == null)
+                .Where(e => essayIds.Contains(e.Id)
+                         && e.AiClaimId == claimId
+                         && e.Status == EssayAnswerStatuses.Pending
+                         && e.AiOutcome == null)
                 .ExecuteUpdateAsync(s => s
                         .SetProperty(e => e.AiClaimId, (Guid?)null)
                         .SetProperty(e => e.AiEvaluationAttempts, e => (byte)(e.AiEvaluationAttempts - 1)),
                     CancellationToken.None);
 
         /// <summary>
-        /// The backend's acceptance rule for an AI proposal. Accepted only when the
-        /// AI answered Ok, the score is within 0…maxPoints, the feedback is usable,
-        /// the confidence reaches the threshold, and nothing was flagged. A
-        /// well-formed but unsure or flagged proposal, or an explicit Skipped, goes
-        /// to a person (NeedsReview); anything missing, malformed or with an unknown
-        /// status is retried (Unusable).
+        /// Whether the AI's answer for one essay is a usable grade. There is no
+        /// confidence threshold and no review: a well-formed Ok result IS the grade.
+        /// <list type="bullet">
+        /// <item>No result, or an unknown status → Unusable (retried later).</item>
+        /// <item>"Skipped" → Declined (final: NotGraded).</item>
+        /// <item>Ok (or no status) with whole points within 0…maxPoints, non-blank
+        /// feedback no longer than maxFeedbackLength, and a confidence that is
+        /// either absent or within 0…1 → Accept. Anything else → Unusable.</item>
+        /// </list>
         /// </summary>
         public static EssayDecision Decide(
             EssayEvaluationResult? result,
             int maxPoints,
-            decimal acceptConfidence,
             int maxFeedbackLength)
         {
             if (result is null)
@@ -330,72 +434,89 @@ namespace AssessmentBL.Services
             var status = result.Status ?? AiResultStatuses.Ok;
 
             if (string.Equals(status, AiResultStatuses.Skipped, StringComparison.OrdinalIgnoreCase))
-                return EssayDecision.NeedsReview(null, null, null);
+                return EssayDecision.Declined;
 
             if (!string.Equals(status, AiResultStatuses.Ok, StringComparison.OrdinalIgnoreCase))
                 return EssayDecision.Unusable;
 
-            if (result.ProposedPoints is not int points || points < 0 || points > maxPoints)
+            if (result.Points is not int points || points < 0 || points > maxPoints)
                 return EssayDecision.Unusable;
 
             var feedback = result.Feedback?.Trim();
             if (string.IsNullOrEmpty(feedback) || feedback.Length > maxFeedbackLength)
                 return EssayDecision.Unusable;
 
-            if (result.Confidence is not decimal confidence || confidence < 0m || confidence > 1m)
+            // Optional and never a gate, but a value outside 0…1 means the response
+            // is not what the contract describes, so nothing in it is trusted.
+            if (result.Confidence is decimal confidence && (confidence < 0m || confidence > 1m))
                 return EssayDecision.Unusable;
 
-            var flagged = result.Flags?.Any(f => !string.IsNullOrWhiteSpace(f)) ?? false;
-
-            return flagged || confidence < acceptConfidence
-                ? EssayDecision.NeedsReview(points, feedback, confidence)
-                : EssayDecision.Accept(points, feedback, confidence);
+            return EssayDecision.Accept(points, feedback, result.Confidence);
         }
 
-        /// <summary>The attempt was already counted when the answer was claimed.</summary>
-        private void Apply(QuizAttemptEssayAnswer essay, EssayDecision decision, DateTime now)
+        /// <summary>
+        /// Writes a decision onto a claimed Pending answer. The attempt was already
+        /// counted when the answer was claimed, so an Unusable result on the last
+        /// allowed attempt closes the answer as NotGraded / Failed.
+        /// </summary>
+        public static void Apply(QuizAttemptEssayAnswer essay, EssayDecision decision, DateTime now, int maxAttempts)
         {
             switch (decision.Kind)
             {
                 case EssayDecisionKind.Accept:
-                    RecordProposal(essay, decision);
-                    essay.AiOutcome = EssayAiOutcomes.Accepted;
-
-                    // Only here does a proposal become the grade the child sees.
                     essay.Status = EssayAnswerStatuses.Graded;
                     essay.AwardedPoints = (byte)decision.Points!.Value;
                     essay.Feedback = decision.Feedback;
                     essay.GradedBy = EssayGraders.Ai;
                     essay.GradedAt = now;
+                    essay.AiOutcome = EssayAiOutcomes.Accepted;
+                    essay.AiConfidence = decision.Confidence is decimal confidence
+                        ? Math.Round(confidence, 2, MidpointRounding.AwayFromZero)
+                        : null;
                     break;
 
-                case EssayDecisionKind.NeedsReview:
-                    // Stays Pending; the proposal is kept for the reviewer.
-                    RecordProposal(essay, decision);
-                    essay.AiOutcome = EssayAiOutcomes.NeedsReview;
+                case EssayDecisionKind.Declined:
+                    CloseAsNotGraded(essay, EssayAiOutcomes.Declined);
                     break;
 
                 default:
-                    if (essay.AiEvaluationAttempts >= _settings.EffectiveEssayEvaluationMaxAttempts)
-                        essay.AiOutcome = EssayAiOutcomes.Failed;
+                    // Stays Pending for the next run — unless that was the last try.
+                    if (essay.AiEvaluationAttempts >= maxAttempts)
+                        CloseAsNotGraded(essay, EssayAiOutcomes.Failed);
                     break;
             }
         }
 
-        private static void RecordProposal(QuizAttemptEssayAnswer essay, EssayDecision decision)
+        /// <summary>Final, with no grade: no points, no feedback, no grader.</summary>
+        private static void CloseAsNotGraded(QuizAttemptEssayAnswer essay, string outcome)
         {
-            essay.AiProposedPoints = decision.Points is int points ? (byte)points : null;
-            essay.AiFeedback = decision.Feedback;
-            essay.AiConfidence = decision.Confidence is decimal confidence
-                ? Math.Round(confidence, 2, MidpointRounding.AwayFromZero)
-                : null;
+            essay.Status = EssayAnswerStatuses.NotGraded;
+            essay.AiOutcome = outcome;
+            essay.AwardedPoints = null;
+            essay.Feedback = null;
+            essay.GradedBy = null;
+            essay.GradedAt = null;
+        }
+
+        private static string? ForLog(string? reason)
+        {
+            var clean = AiRequestBuilder.Clean(reason);
+
+            return clean is null || clean.Length <= MaxLoggedReasonLength
+                ? clean
+                : clean[..MaxLoggedReasonLength] + "…";
         }
     }
 
     public enum EssayDecisionKind
     {
+        /// <summary>A well-formed grade: the essay becomes Graded.</summary>
         Accept,
-        NeedsReview,
+
+        /// <summary>The AI answered Skipped: the essay becomes NotGraded, for good.</summary>
+        Declined,
+
+        /// <summary>Nothing usable came back: retried, until the attempts run out.</summary>
         Unusable
     }
 
@@ -403,10 +524,9 @@ namespace AssessmentBL.Services
     {
         public static EssayDecision Unusable { get; } = new(EssayDecisionKind.Unusable, null, null, null);
 
-        public static EssayDecision Accept(int points, string feedback, decimal confidence) =>
-            new(EssayDecisionKind.Accept, points, feedback, confidence);
+        public static EssayDecision Declined { get; } = new(EssayDecisionKind.Declined, null, null, null);
 
-        public static EssayDecision NeedsReview(int? points, string? feedback, decimal? confidence) =>
-            new(EssayDecisionKind.NeedsReview, points, feedback, confidence);
+        public static EssayDecision Accept(int points, string feedback, decimal? confidence) =>
+            new(EssayDecisionKind.Accept, points, feedback, confidence);
     }
 }

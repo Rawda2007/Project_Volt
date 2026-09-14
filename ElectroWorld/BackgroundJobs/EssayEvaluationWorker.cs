@@ -51,7 +51,7 @@ public sealed class EssayEvaluationWorker : BackgroundService
             var decided = await essays.EvaluateDueAsync(stoppingToken);
 
             if (decided > 0)
-                _logger.LogInformation("Evaluated {Count} pending essay answer(s).", decided);
+                _logger.LogInformation("Finished {Count} pending essay answer(s) (Graded or NotGraded).", decided);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {

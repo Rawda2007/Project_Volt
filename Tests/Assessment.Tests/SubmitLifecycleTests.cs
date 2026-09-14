@@ -101,6 +101,17 @@ public class SubmitLifecycleModelTests
     }
 
     [Theory]
+    [InlineData(nameof(QuizAttemptResultDto.TotalPoints))]
+    [InlineData(nameof(QuizAttemptResultDto.EarnedPoints))]
+    [InlineData(nameof(QuizAttemptResultDto.PendingPoints))]
+    public void ResultDto_PointTotalsAreInt_BecauseTinyintSumsOverflowAByte(string property)
+        => Assert.Equal(typeof(int), typeof(QuizAttemptResultDto).GetProperty(property)!.PropertyType);
+
+    [Fact]
+    public void EssayResult_NeverNamesAGrader_TheAiIsTheOnlyOne()
+        => Assert.Null(typeof(EssayResultDto).GetProperty("GradedBy"));
+
+    [Theory]
     [InlineData(typeof(LessonQuizResponseDto))]
     [InlineData(typeof(QuizQuestionForAttemptDto))]
     [InlineData(typeof(QuizAnswerOptionDto))]

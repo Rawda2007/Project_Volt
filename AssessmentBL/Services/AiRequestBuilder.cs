@@ -80,26 +80,29 @@ namespace AssessmentBL.Services
             return new AiImage { Description = description, Content = content };
         }
 
-        /// <summary>Question id → localized topic name (requested → fallback → base).</summary>
+        /// <summary>
+        /// Question id → localized topic name (requested → fallback → base). A
+        /// question with no topic is absent, so its request carries "topic": null.
+        /// </summary>
         public Task<Dictionary<int, string>> LoadTopicNamesAsync(
             List<int> questionIds,
             string language,
             CancellationToken cancellationToken) =>
             _db.Questions
                 .AsNoTracking()
-                .Where(q => questionIds.Contains(q.Id))
+                .Where(q => questionIds.Contains(q.Id) && q.TopicId != null)
                 .Select(q => new
                 {
                     q.Id,
-                    Name = q.Topic.TopicTranslations
+                    Name = q.Topic!.TopicTranslations
                             .Where(t => t.LanguageCode == language)
                             .Select(t => t.Name)
                             .FirstOrDefault()
-                        ?? q.Topic.TopicTranslations
+                        ?? q.Topic!.TopicTranslations
                             .Where(t => t.LanguageCode == ContentLanguages.Fallback)
                             .Select(t => t.Name)
                             .FirstOrDefault()
-                        ?? q.Topic.Name
+                        ?? q.Topic!.Name
                 })
                 .ToDictionaryAsync(x => x.Id, x => x.Name, cancellationToken);
 

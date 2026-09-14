@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Shared.Common.Abstractions;
+using Shared.Common.Exceptions;
 using Shared.Content;
 
 namespace AssessmentBL.Services
@@ -166,9 +167,13 @@ namespace AssessmentBL.Services
                 .ToList();
         }
 
-        /// <summary>Grades a finished placement against the current level order.</summary>
+        /// <summary>
+        /// Grades a finished placement against the current level order.
+        /// <paramref name="pointsOfAskedQuestion"/> maps every auto-graded question
+        /// of the attempt to its Points frozen at attempt start.
+        /// </summary>
         public async Task<PlacementDecision> EvaluateAsync(
-            IReadOnlyCollection<int> askedQuestionIds,
+            IReadOnlyDictionary<int, byte> pointsOfAskedQuestion,
             IReadOnlySet<int> wrongQuestionIds,
             decimal passPercentage,
             CancellationToken cancellationToken = default)
@@ -176,11 +181,11 @@ namespace AssessmentBL.Services
             var levels = await _levels.GetLevelsInOrderAsync(cancellationToken);
 
             if (levels.Count == 0)
-                throw new InvalidOperationException("لا توجد مستويات متاحة لتحديد مستوى الطالب");
+                throw new BusinessRuleException("لا توجد مستويات متاحة لتحديد مستوى الطالب");
 
-            var levelOfQuestion = await LoadLevelOfQuestionAsync(askedQuestionIds, cancellationToken);
+            var levelOfQuestion = await LoadLevelOfQuestionAsync(pointsOfAskedQuestion.Keys.ToList(), cancellationToken);
 
-            var decision = Decide(levels, levelOfQuestion, wrongQuestionIds, passPercentage);
+            var decision = Decide(levels, levelOfQuestion, pointsOfAskedQuestion, wrongQuestionIds, passPercentage);
 
             if (decision.Levels.First(o => o.Level.Id == decision.PlacedLevel.Id).QuestionsAsked == 0)
                 _logger.LogWarning(
@@ -195,7 +200,8 @@ namespace AssessmentBL.Services
         /// <summary>
         /// Re-describes a stored placement. The placed level is the stored one; the
         /// per-level breakdown is recomputed from the attempt's saved answers with
-        /// the threshold that was stored with it.
+        /// the threshold that was stored with it and the Points frozen in the
+        /// attempt's snapshot.
         /// </summary>
         public async Task<PlacementResultDto> DescribeAsync(
             long attemptId,
@@ -205,11 +211,11 @@ namespace AssessmentBL.Services
             DateTime placedAt,
             CancellationToken cancellationToken = default)
         {
-            var askedQuestionIds = await _db.QuizAttemptQuestions
+            var pointsOfAskedQuestion = await _db.QuizAttemptQuestions
                 .AsNoTracking()
                 .Where(aq => aq.QuizAttemptId == attemptId && aq.QuestionType != QuestionTypes.Essay)
-                .Select(aq => aq.QuestionId)
-                .ToListAsync(cancellationToken);
+                .Select(aq => new { aq.QuestionId, aq.Points })
+                .ToDictionaryAsync(aq => aq.QuestionId, aq => aq.Points, cancellationToken);
 
             var wrongQuestionIds = (await _db.QuizAttemptMistakes
                     .AsNoTracking()
@@ -229,10 +235,10 @@ namespace AssessmentBL.Services
                     PlacedAt = placedAt
                 };
 
-            var levelOfQuestion = await LoadLevelOfQuestionAsync(askedQuestionIds, cancellationToken);
+            var levelOfQuestion = await LoadLevelOfQuestionAsync(pointsOfAskedQuestion.Keys.ToList(), cancellationToken);
 
             return ToResultDto(
-                Decide(levels, levelOfQuestion, wrongQuestionIds, passPercentage),
+                Decide(levels, levelOfQuestion, pointsOfAskedQuestion, wrongQuestionIds, passPercentage),
                 placedLevelId,
                 scorePercentage,
                 placedAt);
@@ -240,15 +246,18 @@ namespace AssessmentBL.Services
 
         /// <summary>
         /// The placement rule. A level is mastered when at least one of its
-        /// questions was asked and the child's score on them reached
-        /// <paramref name="passPercentage"/>. The child is placed at the first level,
-        /// in learning order, that is not mastered — a level with no placement
+        /// questions was asked and the child's score on them — the Points of the
+        /// ones answered correctly ÷ the Points of all of them — reached
+        /// <paramref name="passPercentage"/>. With every question worth 1 that is
+        /// simply correct ÷ asked. The child is placed at the first level, in
+        /// learning order, that is not mastered — a level with no placement
         /// questions cannot be shown mastered, so the test never skips a child past
         /// a level it could not check. Mastering every level places them at the last.
         /// </summary>
         public static PlacementDecision Decide(
             IReadOnlyList<LevelSummary> levelsInOrder,
             IReadOnlyDictionary<int, int> levelOfQuestion,
+            IReadOnlyDictionary<int, byte> pointsOfQuestion,
             IReadOnlySet<int> wrongQuestionIds,
             decimal passPercentage)
         {
@@ -264,14 +273,34 @@ namespace AssessmentBL.Services
                     .Select(q => q.Key)
                     .ToList();
 
-                var correct = asked.Count(id => !wrongQuestionIds.Contains(id));
+                var correct = 0;
+                var totalPoints = 0;
+                var earnedPoints = 0;
 
-                var score = asked.Count == 0
+                foreach (var questionId in asked)
+                {
+                    // Both maps are built from the same attempt snapshot, so a
+                    // question without Points is a caller bug, not a zero-point question.
+                    if (!pointsOfQuestion.TryGetValue(questionId, out var points))
+                        throw new ArgumentException(
+                            $"No Points were supplied for question {questionId}.", nameof(pointsOfQuestion));
+
+                    totalPoints += points;
+
+                    if (wrongQuestionIds.Contains(questionId))
+                        continue;
+
+                    correct++;
+                    earnedPoints += points;
+                }
+
+                var score = totalPoints == 0
                     ? 0m
-                    : Math.Round(correct * 100m / asked.Count, 2, MidpointRounding.AwayFromZero);
+                    : Math.Round(earnedPoints * 100m / totalPoints, 2, MidpointRounding.AwayFromZero);
 
                 outcomes.Add(new PlacementLevelOutcome(
-                    level, asked.Count, correct, score, asked.Count > 0 && score >= passPercentage));
+                    level, asked.Count, correct, totalPoints, earnedPoints, score,
+                    asked.Count > 0 && score >= passPercentage));
             }
 
             var placed = outcomes.FirstOrDefault(o => !o.Mastered)?.Level
@@ -306,6 +335,8 @@ namespace AssessmentBL.Services
                         LevelTitle = o.Level.Title,
                         QuestionsAsked = o.QuestionsAsked,
                         CorrectAnswers = o.CorrectAnswers,
+                        TotalPoints = o.TotalPoints,
+                        EarnedPoints = o.EarnedPoints,
                         ScorePercentage = o.ScorePercentage,
                         Mastered = o.Mastered
                     })
@@ -338,6 +369,8 @@ namespace AssessmentBL.Services
         LevelSummary Level,
         int QuestionsAsked,
         int CorrectAnswers,
+        int TotalPoints,
+        int EarnedPoints,
         decimal ScorePercentage,
         bool Mastered);
 

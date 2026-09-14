@@ -12,7 +12,7 @@ namespace AssessmentBL.Interfaces
         /// <summary>
         /// Background run: evaluates one batch of essays whose inline evaluation
         /// failed or never ran, respecting the retry delay and attempt limit.
-        /// Returns how many were decided (graded or sent to review).
+        /// Returns how many reached a final state (Graded or NotGraded).
         /// </summary>
         Task<int> EvaluateDueAsync(CancellationToken cancellationToken);
     }

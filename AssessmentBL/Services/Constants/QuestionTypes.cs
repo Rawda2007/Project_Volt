@@ -11,7 +11,7 @@ namespace AssessmentBL.Services.Constants
 
         /// <summary>
         /// True when the backend can score the answer itself. Essay cannot —
-        /// it is stored for review and excluded from the score denominator.
+        /// the AI grades it after the submission, so it never enters ScorePercentage.
         /// </summary>
         public static bool IsAutoGraded(string questionType) => questionType != Essay;
 

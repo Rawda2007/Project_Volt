@@ -6,8 +6,8 @@ namespace AssessmentBL.DTOs.QuizAttempt
         public int QuestionId { get; set; }
 
         /// <summary>
-        /// Which press this was: 1 = a soft nudge, 2 = a more direct hint. A third
-        /// press is refused with 409.
+        /// Which level this press was for: 1 = a soft nudge, 2 = a more direct hint.
+        /// A press after the last level is refused with 409.
         /// </summary>
         public byte AttemptNumber { get; set; }
 
@@ -15,11 +15,20 @@ namespace AssessmentBL.DTOs.QuizAttempt
         public string? Hint { get; set; }
 
         /// <summary>
-        /// Generated — the hint is here. Partial — the AI answered but the hint
-        /// gave the answer away or was unusable, so nothing was saved and this
-        /// press did not use up a level. Unavailable — the AI could not be reached.
+        /// Generated — the hint is here and this level is used. Partial — the AI
+        /// failed, timed out, or its hint was unusable or gave the answer away.
+        /// Unavailable — the hint AI is not configured, or the question cannot be
+        /// described to it. After Partial and Unavailable nothing was saved and no
+        /// level was used: the press is not counted against the child.
         /// </summary>
         public string HintsStatus { get; set; } = null!;
+
+        /// <summary>
+        /// Presses still available for this question in this attempt, after this
+        /// one. Unchanged by a Partial or Unavailable press. 0 means the button can
+        /// be disabled.
+        /// </summary>
+        public int HintsRemaining { get; set; }
 
         public string Language { get; set; } = null!;
     }

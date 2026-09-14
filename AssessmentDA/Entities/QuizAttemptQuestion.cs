@@ -14,9 +14,10 @@ public partial class QuizAttemptQuestion
     /// <summary>
     /// Topic the question was classified under when the attempt started.
     /// Statistics for this attempt are attributed here, not to the
-    /// question's current TopicId.
+    /// question's current TopicId. Null when the question had no topic: its
+    /// answer then counts toward no topic statistics.
     /// </summary>
-    public int TopicId { get; set; }
+    public int? TopicId { get; set; }
 
     /// <summary>
     /// Difficulty the question carried when the attempt started.
@@ -39,13 +40,22 @@ public partial class QuizAttemptQuestion
     /// </summary>
     public string QuestionType { get; set; } = null!;
 
+    /// <summary>
+    /// The question's Points when the attempt started (1 unless the admin set
+    /// another value). Frozen like the answer key: the score, the essay's
+    /// MaxPoints, the placement and the result totals all weigh the question by
+    /// this value, so an admin re-weighting the question later cannot change how
+    /// an in-flight or past attempt counts. CK_QuizAttemptQuestions_Points (&gt; 0).
+    /// </summary>
+    public byte Points { get; set; }
+
     public DateTime CreatedAt { get; set; }
 
     public virtual QuizAttempt QuizAttempt { get; set; } = null!;
 
     public virtual Question Question { get; set; } = null!;
 
-    public virtual Topic Topic { get; set; } = null!;
+    public virtual Topic? Topic { get; set; }
 
     public virtual QuestionOption? CorrectOption { get; set; }
 

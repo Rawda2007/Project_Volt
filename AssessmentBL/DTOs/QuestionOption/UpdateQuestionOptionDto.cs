@@ -8,7 +8,9 @@
 
         /// <summary>
         /// Admin-only semantic description of the image, for the AI. REQUIRED
-        /// when OptionText is blank. NEVER returned to the child.
+        /// (non-blank, at most 1000 characters) whenever ImageUrl is supplied,
+        /// even alongside OptionText; cleared when the image is removed. NEVER
+        /// returned to the child.
         /// </summary>
         public string? ImageDescription { get; set; }
 

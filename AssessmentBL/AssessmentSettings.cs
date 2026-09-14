@@ -65,25 +65,26 @@ namespace AssessmentBL
 
         public int EffectiveMaxHintLevels => Math.Clamp(MaxHintLevels, 1, 5);
 
-        /// <summary>
-        /// Lowest AI confidence (0–1) at which a proposed essay score is accepted as
-        /// the grade. Below it the essay waits for a person.
-        /// </summary>
-        public decimal EssayAutoAcceptConfidence { get; set; } = 0.80m;
-
         /// <summary>Longest essay feedback accepted from the AI.</summary>
         public int MaxEssayFeedbackLength { get; set; } = 1000;
 
         /// <summary>How often the background essay evaluator runs.</summary>
         public int EssayEvaluationIntervalMinutes { get; set; } = 2;
 
-        /// <summary>AI attempts per essay before it is left for a person.</summary>
+        /// <summary>
+        /// AI attempts per essay. When none of them produced a usable grade the
+        /// essay is closed as NotGraded — essays are graded by the AI only.
+        /// </summary>
         public int EssayEvaluationMaxAttempts { get; set; } = 5;
 
         /// <summary>Wait between two AI attempts on the same essay.</summary>
         public int EssayEvaluationRetryMinutes { get; set; } = 10;
 
-        /// <summary>Upper bound on one background evaluation batch.</summary>
+        /// <summary>
+        /// How long one AI evaluation request (one attempt's essays) may take. An
+        /// AI that does not answer in time has used up one of the essay's attempts.
+        /// A background batch also stops starting new requests after this long.
+        /// </summary>
         public int EssayEvaluationTimeoutSeconds { get; set; } = 30;
 
         /// <summary>
@@ -95,8 +96,6 @@ namespace AssessmentBL
         public long EffectiveAiMaxImageBytes => Math.Clamp(AiMaxImageBytes, 10_000, 5_000_000);
 
         public int EffectiveMaxHintLength => Math.Clamp(MaxHintLength, 50, 2000);
-
-        public decimal EffectiveEssayAutoAcceptConfidence => Math.Clamp(EssayAutoAcceptConfidence, 0.5m, 1m);
 
         public int EffectiveMaxEssayFeedbackLength => Math.Clamp(MaxEssayFeedbackLength, 100, 4000);
 
@@ -115,14 +114,27 @@ namespace AssessmentBL
             TimeSpan.FromMinutes(Math.Max(EssayInlineGraceMinutes, 1));
 
         /// <summary>
+        /// Longer than any run can hold a claim before saving its decisions. Inline,
+        /// everything but the save is bounded by AiHintTimeout. In the background, a
+        /// request may start just before the batch deadline (EssayEvaluationTimeout)
+        /// and then take one EssayEvaluationTimeout of its own. The extra minute
+        /// covers the database work around it. An older claim belongs to a run that
+        /// died, so its essay may be closed without cutting off a live AI call.
+        /// </summary>
+        public TimeSpan EssayClaimLifetime =>
+            (AiHintTimeout > 2 * EssayEvaluationTimeout ? AiHintTimeout : 2 * EssayEvaluationTimeout)
+            + TimeSpan.FromMinutes(1);
+
+        /// <summary>
         /// Questions the placement test takes from each level's LevelAssessment
         /// quiz (in that quiz's DisplayOrder).
         /// </summary>
         public int PlacementQuestionsPerLevel { get; set; } = 4;
 
         /// <summary>
-        /// Percentage of a level's placement questions a child must get right for
-        /// that level to count as mastered. With 4 questions, 75 means 3 of 4.
+        /// Percentage of the Points of a level's placement questions a child must
+        /// earn for that level to count as mastered. With 4 one-point questions,
+        /// 75 means 3 of 4.
         /// </summary>
         public int PlacementPassPercentage { get; set; } = 75;
 
@@ -134,6 +146,22 @@ namespace AssessmentBL
         public decimal EffectivePlacementPassPercentage => Math.Clamp(PlacementPassPercentage, 1, 100);
 
         public int EffectiveEssayAnswerMaxLength => Math.Clamp(EssayAnswerMaxLength, 100, 20000);
+
+        /// <summary>
+        /// Share of correct MultipleChoice/TrueFalse answers, in percent, a child
+        /// needs in a topic for the progress screen to show it as Mastered.
+        /// </summary>
+        public int TopicMasteryPercentage { get; set; } = 80;
+
+        /// <summary>
+        /// Answers a topic needs before it can show as Mastered, so a single lucky
+        /// answer is not mastery.
+        /// </summary>
+        public int TopicMasteryMinQuestions { get; set; } = 5;
+
+        public int EffectiveTopicMasteryPercentage => Math.Clamp(TopicMasteryPercentage, 50, 100);
+
+        public int EffectiveTopicMasteryMinQuestions => Math.Clamp(TopicMasteryMinQuestions, 1, 50);
 
         /// <summary>
         /// The abandonment rule, in one place: an attempt that is still InProgress

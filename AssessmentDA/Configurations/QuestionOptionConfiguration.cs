@@ -13,11 +13,10 @@ public class QuestionOptionConfiguration : IEntityTypeConfiguration<QuestionOpti
             tb.HasCheckConstraint("CK_QuestionOptions_TextOrImage",
                 "[OptionText] IS NOT NULL OR [ImageUrl] IS NOT NULL");
 
-            // An option the child can only see as an image must carry a
-            // description, or the AI has nothing to reason about.
-            tb.HasCheckConstraint("CK_QuestionOptions_ImageOptionHasDescription",
-                "([OptionText] IS NOT NULL AND LTRIM(RTRIM([OptionText])) <> '') "
-              + "OR [ImageDescription] IS NOT NULL");
+            // Any option with an image must describe it, even when it also has
+            // text: the AI reads text only, and the text may just label the image.
+            tb.HasCheckConstraint("CK_QuestionOptions_ImageHasDescription",
+                "[ImageUrl] IS NULL OR ([ImageDescription] IS NOT NULL AND LTRIM(RTRIM([ImageDescription])) <> N'')");
         });
 
         // Filtered unique index: at most one IsCorrect = 1 row per question.

@@ -1,6 +1,7 @@
 using ContentBL.Interfaces;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Shared.Common.Exceptions;
 
 namespace ContentBL.Services;
 
@@ -20,15 +21,18 @@ public class LocalImageStorageService : IImageStorageService
     public async Task<string> SaveImageAsync(IFormFile file, CancellationToken ct = default)
     {
         if (file.Length == 0)
-            throw new InvalidOperationException("الملف فاضي");
+            throw new BusinessRuleException("الملف فاضي");
 
         if (file.Length > MaxFileSizeBytes)
-            throw new InvalidOperationException("حجم الصورة أكبر من 5 ميجا");
+            throw new BusinessRuleException("حجم الصورة أكبر من 5 ميجا");
 
         var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
         if (!AllowedExtensions.Contains(extension))
-            throw new InvalidOperationException("امتداد الصورة غير مسموح - المسموح بس jpg, jpeg, png, webp");
+            throw new BusinessRuleException("امتداد الصورة غير مسموح - المسموح بس jpg, jpeg, png, webp");
 
+        // Deliberately NOT a BusinessRuleException: a missing wwwroot is a server
+        // misconfiguration the uploader cannot fix, so it must surface as a 500
+        // and its setup hint must never reach the client.
         var webRootPath = _environment.WebRootPath
             ?? throw new InvalidOperationException("wwwroot مش متظبطة، شوفي app.UseStaticFiles() في Program.cs");
 

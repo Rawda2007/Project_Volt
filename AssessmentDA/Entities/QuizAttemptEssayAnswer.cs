@@ -8,6 +8,7 @@ namespace AssessmentDA.Entities;
 /// QuizAttemptMistake because it has a grading lifecycle and does not mean
 /// "this answer was wrong", and separate from QuizAttemptQuestion because that
 /// row is written once at attempt start and never modified.
+/// Essays are graded by the AI only.
 /// </summary>
 public partial class QuizAttemptEssayAnswer
 {
@@ -19,14 +20,16 @@ public partial class QuizAttemptEssayAnswer
 
     public string AnswerText { get; set; } = null!;
 
-    /// <summary>Pending | Graded | Skipped.</summary>
+    /// <summary>Pending | Graded | NotGraded. Only Pending is not final.</summary>
     public string Status { get; set; } = null!;
 
+    /// <summary>Only when Graded.</summary>
     public byte? AwardedPoints { get; set; }
 
+    /// <summary>The AI's feedback for the child. Only when Graded.</summary>
     public string? Feedback { get; set; }
 
-    /// <summary>Human | Ai. Null until graded.</summary>
+    /// <summary>"Ai" when Graded, otherwise null. The AI is the only grader.</summary>
     public string? GradedBy { get; set; }
 
     public DateTime? GradedAt { get; set; }
@@ -37,28 +40,31 @@ public partial class QuizAttemptEssayAnswer
     public string LanguageCode { get; set; } = null!;
 
     /// <summary>
-    /// The question's Points when the answer was submitted — the grade's
-    /// ceiling (CK_QuizAttemptEssayAnswers_AwardedWithinMax). Frozen so a later
-    /// edit of the question cannot put a grade above the maximum shown.
+    /// Copied at submit from QuizAttemptQuestions.Points, i.e. the question's
+    /// Points frozen at attempt start — the grade's ceiling
+    /// (CK_QuizAttemptEssayAnswers_AwardedWithinMax). Frozen so a later edit of
+    /// the question cannot put a grade above the maximum shown.
     /// </summary>
     public byte MaxPoints { get; set; }
 
-    // ---- AI evaluation: the proposal and its processing state. The grade the
-    // ---- child sees is Status / AwardedPoints / Feedback above — only a
-    // ---- proposal the backend accepted is copied there.
+    // ---- AI evaluation: processing state. The grade itself is Status /
+    // ---- AwardedPoints / Feedback above.
 
-    /// <summary>Accepted | NeedsReview | Failed. Null until the AI has been decided on.</summary>
+    /// <summary>
+    /// How the evaluation ended: Accepted (Graded) | Declined | Failed (both
+    /// NotGraded). Null exactly while Pending (CK_QuizAttemptEssayAnswers_OutcomeMatchesStatus).
+    /// </summary>
     public string? AiOutcome { get; set; }
 
     public byte AiEvaluationAttempts { get; set; }
 
     public DateTime? AiLastAttemptAt { get; set; }
 
-    public byte? AiProposedPoints { get; set; }
-
+    /// <summary>
+    /// The confidence the AI reported with its grade, when it sent one.
+    /// For monitoring only: it never decides whether a grade is accepted.
+    /// </summary>
     public decimal? AiConfidence { get; set; }
-
-    public string? AiFeedback { get; set; }
 
     /// <summary>
     /// Which evaluation run owns the answer right now. Set atomically when a run

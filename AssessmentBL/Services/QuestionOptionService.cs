@@ -114,7 +114,7 @@ namespace AssessmentBL.Services
                         cancellationToken: cancellationToken);
 
                 if (correctOptionsCount == 1)
-                    throw new InvalidOperationException(
+                    throw new BusinessRuleException(
                         $"لا يمكن إلغاء الإجابة الصحيحة الوحيدة من السؤال رقم {option.QuestionId} وهو مفعّل");
             }
 
@@ -139,7 +139,7 @@ namespace AssessmentBL.Services
                 .AnyAsync(m => m.SelectedOptionId == optionId, cancellationToken: cancellationToken);
 
             if (isReferenced)
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     $"لا يمكن حذف الاختيار رقم {optionId} لأنه مستخدم في محاولات سابقة");
 
             // FK_QuizAttemptQuestions_QuestionId_CorrectOptionId would block this
@@ -149,7 +149,7 @@ namespace AssessmentBL.Services
                 .AnyAsync(aq => aq.CorrectOptionId == optionId, cancellationToken: cancellationToken);
 
             if (isSnapshottedAnswerKey)
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     $"لا يمكن حذف الاختيار رقم {optionId} لأنه الإجابة الصحيحة المسجّلة في محاولات سابقة");
 
             var question = await _db.Questions
@@ -162,7 +162,7 @@ namespace AssessmentBL.Services
             // least two options and TrueFalse exactly two — the rule SetActiveAsync
             // enforced when it was published.
             if (question.IsActive && question.OptionCount <= 2)
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     $"لا يمكن حذف الاختيار رقم {optionId}: السؤال رقم {option.QuestionId} مفعّل ويحتاج إلى اختيارين على الأقل");
 
             var questionIsActive = question.IsActive;
@@ -177,7 +177,7 @@ namespace AssessmentBL.Services
                         cancellationToken: cancellationToken);
 
                 if (correctOptionsCount == 1)
-                    throw new InvalidOperationException(
+                    throw new BusinessRuleException(
                         $"لا يمكن حذف الإجابة الصحيحة الوحيدة من السؤال رقم {option.QuestionId} وهو مفعّل");
             }
 
@@ -220,7 +220,7 @@ namespace AssessmentBL.Services
                             && (excludingOptionId == null || o.Id != excludingOptionId.Value), cancellationToken: cancellationToken);
 
             if (taken)
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     $"الترتيب {displayOrder} مستخدم بالفعل في السؤال رقم {questionId}");
         }
 
@@ -234,13 +234,17 @@ namespace AssessmentBL.Services
                             && (excludingOptionId == null || o.Id != excludingOptionId.Value), cancellationToken: cancellationToken);
 
             if (alreadyHasCorrect)
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     $"السؤال رقم {questionId} له إجابة صحيحة بالفعل");
         }
 
+        // Mirrors the NVARCHAR(1000) ImageDescription column.
+        private const int MaxImageDescriptionLength = 1000;
+
         /// <summary>
         /// An option may be text-only, image-only, or both — but never neither.
-        /// Mirrors CK_QuestionOptions_TextOrImage so the admin gets a clear message
+        /// Mirrors CK_QuestionOptions_TextOrImage and
+        /// CK_QuestionOptions_ImageHasDescription so the admin gets a clear message
         /// instead of a raw check-constraint violation.
         /// </summary>
         private static (string? OptionText, string? ImageUrl, string? ImageDescription) NormalizeContent(
@@ -248,19 +252,28 @@ namespace AssessmentBL.Services
         {
             var text = string.IsNullOrWhiteSpace(optionText) ? null : optionText.Trim();
             var image = string.IsNullOrWhiteSpace(imageUrl) ? null : imageUrl.Trim();
-            var description = string.IsNullOrWhiteSpace(imageDescription) ? null : imageDescription.Trim();
+
+            // A description without an image is dropped, so it can never outlive a
+            // removed image and describe something the child does not see.
+            var description = image is null || string.IsNullOrWhiteSpace(imageDescription)
+                ? null
+                : imageDescription.Trim();
 
             if (text is null && image is null)
                 throw new ArgumentException(
                     "الاختيار يجب أن يحتوي على نص أو صورة على الأقل", nameof(optionText));
 
-            // Mirrors CK_QuestionOptions_ImageOptionHasDescription. An option the
-            // child can only see as an image must carry a description, or the AI
-            // receives nothing for the child's answer and no hint can be produced.
-            if (text is null && description is null)
+            // Required even when the option also has text: the AI never looks at
+            // images, and the text may only label the picture ("A", "B"), so
+            // without a description the AI cannot tell what the child picked.
+            if (image is not null && description is null)
                 throw new ArgumentException(
-                    "الاختيار الذي يعتمد على صورة فقط يجب أن يحتوي على وصف للصورة حتى يتمكن النظام من تحليل إجابة الطالب",
+                    "الاختيار الذي يحتوي على صورة يجب أن يحتوي على وصف للصورة حتى يتمكن النظام من تحليل إجابة الطالب",
                     nameof(imageDescription));
+
+            if (description is not null && description.Length > MaxImageDescriptionLength)
+                throw new ArgumentException(
+                    $"وصف الصورة لا يتجاوز {MaxImageDescriptionLength} حرف", nameof(imageDescription));
 
             return (text, image, description);
         }
@@ -280,11 +293,11 @@ namespace AssessmentBL.Services
                 .FirstAsync(cancellationToken);
 
             if (!QuestionTypes.UsesOptions(question.QuestionType))
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     $"السؤال رقم {questionId} سؤال مقالي ولا يقبل اختيارات");
 
             if (question.QuestionType == QuestionTypes.TrueFalse && question.OptionCount >= 2)
-                throw new InvalidOperationException(
+                throw new BusinessRuleException(
                     $"سؤال الصح والخطأ رقم {questionId} له اختياران بالفعل");
         }
 

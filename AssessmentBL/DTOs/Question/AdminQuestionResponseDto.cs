@@ -7,7 +7,8 @@ namespace AssessmentBL.DTOs.Question
 
         public int QuizId { get; set; }
 
-        public int TopicId { get; set; }
+        /// <summary>Null when the question belongs to no topic.</summary>
+        public int? TopicId { get; set; }
 
         public string QuestionText { get; set; } = null!;
 

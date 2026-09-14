@@ -21,6 +21,16 @@ public class QuestionHintConfiguration : IEntityTypeConfiguration<QuestionHint>
         entity.HasIndex(e => new { e.QuizAttemptId, e.QuestionId, e.LanguageCode, e.HintSequence },
             "UQ_QuestionHints_AttemptId_QuestionId_Language_Sequence").IsUnique();
 
+        // One Hint-button hint per level per attempt + question, in ANY language.
+        // The index above is per language, so two presses at the same moment (in
+        // two languages, or in one where the second read the sequence after the
+        // first saved) could both store level 1. Filtered: post-submission hints
+        // have no level (db/migrations/002).
+        entity.HasIndex(e => new { e.QuizAttemptId, e.QuestionId, e.AttemptNumber },
+                "UQ_QuestionHints_AttemptId_QuestionId_AttemptNumber")
+            .IsUnique()
+            .HasFilter("[AttemptNumber] IS NOT NULL");
+
         entity.Property(e => e.LanguageCode)
             .HasMaxLength(5)
             .HasDefaultValue("ar");

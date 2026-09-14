@@ -9,7 +9,12 @@ public partial class Question
 
     public int QuizId { get; set; }
 
-    public int TopicId { get; set; }
+    /// <summary>
+    /// Optional. A question with no topic is asked, graded and earns XP like any
+    /// other; it simply has no topic for its answers to count toward in
+    /// UserTopicStats.
+    /// </summary>
+    public int? TopicId { get; set; }
 
     public string QuestionText { get; set; } = null!;
 
@@ -20,10 +25,11 @@ public partial class Question
     public string? ImageUrl { get; set; }
 
     /// <summary>
-    /// Admin-authored semantic description of <see cref="ImageUrl"/>. This is
-    /// the AI-visible equivalent of the question text when the question is
-    /// carried by an image the AI cannot see.
-    /// NEVER returned in a child-facing response.
+    /// Admin-authored semantic description of <see cref="ImageUrl"/>. The AI
+    /// never looks at images, so this is the only way it learns what the image
+    /// shows. CK_Questions_ImageHasDescription requires it whenever ImageUrl is
+    /// set; it is NULL when there is no image, so a description never outlives
+    /// a removed image. NEVER returned in a child-facing response.
     /// </summary>
     public string? ImageDescription { get; set; }
 
@@ -43,7 +49,7 @@ public partial class Question
 
     public virtual ICollection<QuizAttemptMistake> QuizAttemptMistakes { get; set; } = new List<QuizAttemptMistake>();
 
-    public virtual Topic Topic { get; set; } = null!;
+    public virtual Topic? Topic { get; set; }
     public virtual ICollection<QuizAttemptQuestion> QuizAttemptQuestions { get; set; }
     = new List<QuizAttemptQuestion>();
 

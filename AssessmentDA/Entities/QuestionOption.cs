@@ -17,11 +17,12 @@ public partial class QuestionOption
     public string? ImageUrl { get; set; }
 
     /// <summary>
-    /// Admin-authored semantic description of <see cref="ImageUrl"/>. This is
-    /// the AI-visible equivalent of <see cref="OptionText"/> for an image-only
-    /// option — without it the AI receives nothing for the child's answer.
-    /// CK_QuestionOptions_ImageOptionHasDescription requires it whenever
-    /// OptionText is blank. NEVER returned in a child-facing response.
+    /// Admin-authored semantic description of <see cref="ImageUrl"/>. The AI
+    /// never looks at images, so without it the AI cannot tell what the child
+    /// picked. CK_QuestionOptions_ImageHasDescription requires it whenever
+    /// ImageUrl is set — even when <see cref="OptionText"/> is also present,
+    /// because the text may only label the picture. NULL when there is no
+    /// image. NEVER returned in a child-facing response.
     /// </summary>
     public string? ImageDescription { get; set; }
 

@@ -1,4 +1,5 @@
 {
-  "statusCode": 404,
-  "message": "المحاولة رقم 42 غير موجودة"
+  "success": false,
+  "message": "المحاولة رقم 42 غير موجودة",
+  "data": null
 }

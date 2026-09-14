@@ -56,56 +56,81 @@ public class HintSafetyTests
         => Assert.False(HintSafety.RevealsAnswer(hint, correctOptionText));
 }
 
-/// <summary>The AI proposes; the backend decides.</summary>
+/// <summary>
+/// Essays are graded by the AI only: a well-formed grade is final, Skipped is
+/// final with no grade, and anything unusable is retried. Nothing waits for a person.
+/// </summary>
 public class EssayDecisionTests
 {
-    private const decimal Threshold = 0.8m;
     private const int MaxFeedback = 1000;
 
     private static EssayDecision Decide(
         int? points = 2, string? feedback = "أحسنت، ولكن اذكر دور المقاومة.", decimal? confidence = 0.9m,
-        string? status = "Ok", IReadOnlyList<string>? flags = null, int maxPoints = 3) =>
+        string? status = "Ok", int maxPoints = 3) =>
         EssayEvaluationService.Decide(
             new EssayEvaluationResult
             {
-                ItemId = "1", Status = status, ProposedPoints = points,
-                Feedback = feedback, Confidence = confidence, Flags = flags
+                ItemId = "1", Status = status, Points = points,
+                Feedback = feedback, Confidence = confidence
             },
-            maxPoints, Threshold, MaxFeedback);
+            maxPoints, MaxFeedback);
 
     [Fact]
-    public void AConfidentWellFormedProposal_IsAccepted()
+    public void AWellFormedGrade_IsAccepted()
     {
-        var decision = Decide();
+        var decision = Decide(feedback: "  أحسنت  ");
 
         Assert.Equal(EssayDecisionKind.Accept, decision.Kind);
         Assert.Equal(2, decision.Points);
+        Assert.Equal("أحسنت", decision.Feedback);
+        Assert.Equal(0.9m, decision.Confidence);
     }
 
+    [Theory]
+    [InlineData(0.0)]
+    [InlineData(0.1)]
+    [InlineData(0.79)]
+    public void ALowConfidence_NeverBlocksTheGrade(double confidence)
+        => Assert.Equal(EssayDecisionKind.Accept, Decide(confidence: (decimal)confidence).Kind);
+
     [Fact]
-    public void AnUnsureProposal_GoesToAPerson_AndIsKept()
+    public void ConfidenceIsOptional()
     {
-        var decision = Decide(confidence: 0.6m);
+        var decision = Decide(confidence: null);
 
-        Assert.Equal(EssayDecisionKind.NeedsReview, decision.Kind);
-        Assert.Equal(2, decision.Points);
+        Assert.Equal(EssayDecisionKind.Accept, decision.Kind);
+        Assert.Null(decision.Confidence);
     }
 
-    [Fact]
-    public void AFlaggedAnswer_GoesToAPerson_HoweverConfident()
-        => Assert.Equal(EssayDecisionKind.NeedsReview, Decide(confidence: 0.99m, flags: ["PersonalData"]).Kind);
+    [Theory]
+    [InlineData(0)]    // no points is still a grade
+    [InlineData(3)]    // exactly MaxPoints
+    public void TheBoundsOfTheScore_AreValidGrades(int points)
+        => Assert.Equal(EssayDecisionKind.Accept, Decide(points: points).Kind);
 
-    [Fact]
-    public void TheAiDeclining_GoesToAPerson()
-        => Assert.Equal(EssayDecisionKind.NeedsReview, Decide(status: "Skipped").Kind);
+    [Theory]
+    [InlineData("Skipped")]
+    [InlineData("skipped")]
+    [InlineData("SKIPPED")]
+    public void TheAiDeclining_IsFinal_WithNoGrade(string status)
+    {
+        var decision = Decide(status: status);
+
+        Assert.Equal(EssayDecisionKind.Declined, decision.Kind);
+        Assert.Null(decision.Points);
+        Assert.Null(decision.Feedback);
+    }
 
     [Fact]
     public void AMissingStatus_IsReadAsOk()
         => Assert.Equal(EssayDecisionKind.Accept, Decide(status: null).Kind);
 
-    [Fact]
-    public void AnUnknownStatus_IsRetried_NotSentToReview()
-        => Assert.Equal(EssayDecisionKind.Unusable, Decide(status: "Error").Kind);
+    [Theory]
+    [InlineData("Error")]
+    [InlineData("NeedsReview")]
+    [InlineData("")]
+    public void AnUnknownStatus_IsRetried(string status)
+        => Assert.Equal(EssayDecisionKind.Unusable, Decide(status: status).Kind);
 
     [Theory]
     [InlineData(4)]    // above MaxPoints
@@ -113,21 +138,31 @@ public class EssayDecisionTests
     public void AScoreOutOfRange_IsUnusable(int points)
         => Assert.Equal(EssayDecisionKind.Unusable, Decide(points: points).Kind);
 
+    [Theory]
+    [InlineData(1.5)]
+    [InlineData(-0.1)]
+    public void AConfidenceOutsideZeroToOne_IsUnusable(double confidence)
+        => Assert.Equal(EssayDecisionKind.Unusable, Decide(confidence: (decimal)confidence).Kind);
+
+    [Fact]
+    public void FeedbackUpToTheLimit_IsAccepted()
+        => Assert.Equal(EssayDecisionKind.Accept, Decide(feedback: new string('x', MaxFeedback)).Kind);
+
     [Fact]
     public void MissingPiecesOrAMissingResult_AreUnusable()
     {
         Assert.Equal(EssayDecisionKind.Unusable, Decide(points: null).Kind);
+        Assert.Equal(EssayDecisionKind.Unusable, Decide(feedback: null).Kind);
         Assert.Equal(EssayDecisionKind.Unusable, Decide(feedback: "  ").Kind);
         Assert.Equal(EssayDecisionKind.Unusable, Decide(feedback: new string('x', MaxFeedback + 1)).Kind);
-        Assert.Equal(EssayDecisionKind.Unusable, Decide(confidence: null).Kind);
-        Assert.Equal(EssayDecisionKind.Unusable, Decide(confidence: 1.5m).Kind);
-        Assert.Equal(EssayDecisionKind.Unusable,
-            EssayEvaluationService.Decide(null, 3, Threshold, MaxFeedback).Kind);
+        Assert.Equal(EssayDecisionKind.Unusable, EssayEvaluationService.Decide(null, 3, MaxFeedback).Kind);
     }
 
     [Fact]
-    public void TheThresholdIsInclusive()
-        => Assert.Equal(EssayDecisionKind.Accept, Decide(confidence: Threshold).Kind);
+    public void ThereIsNoReviewOutcome()
+        => Assert.Equal(
+            new[] { nameof(EssayDecisionKind.Accept), nameof(EssayDecisionKind.Declined), nameof(EssayDecisionKind.Unusable) },
+            Enum.GetNames<EssayDecisionKind>());
 }
 
 public class SubmissionCompletenessTests
@@ -162,11 +197,40 @@ public class AiSettingsDefaultsTests
 
         Assert.False(settings.AiSendImageContent);          // no image bytes unless a vision model is set up
         Assert.Equal(400, settings.EffectiveMaxHintLength);
-        Assert.Equal(0.80m, settings.EffectiveEssayAutoAcceptConfidence);
+        Assert.Equal(1000, settings.EffectiveMaxEssayFeedbackLength);
         Assert.Equal(5, settings.EffectiveEssayEvaluationMaxAttempts);
     }
 
     [Fact]
-    public void TheAcceptThreshold_CannotBeConfiguredBelowAHalf()
-        => Assert.Equal(0.5m, new AssessmentSettings { EssayAutoAcceptConfidence = 0.1m }.EffectiveEssayAutoAcceptConfidence);
+    public void ThereIsNoConfidenceGateToConfigure()
+        => Assert.DoesNotContain(typeof(AssessmentSettings).GetProperties(), p => p.Name.Contains("Confidence"));
+
+    /// <summary>
+    /// The max-attempts pre-close may only close a claim no live run still holds.
+    /// Inline, a run is bounded by AiHintTimeout. In the background, a request can
+    /// start just before the batch deadline and then take a full
+    /// EssayEvaluationTimeout of its own. The lifetime must outlast both, including
+    /// at the clamp limits.
+    /// </summary>
+    [Theory]
+    [InlineData(15, 30)]      // defaults
+    [InlineData(60, 5)]       // long inline budget, short request deadline
+    [InlineData(1, 120)]      // short inline budget, long request deadline
+    [InlineData(0, 999)]      // out of range: clamped to 1 s and 120 s
+    [InlineData(999, 0)]      // out of range: clamped to 60 s and 5 s
+    public void AClaim_OutlivesEveryRunThatCanStillHoldIt(int hintSeconds, int evaluationSeconds)
+    {
+        var settings = new AssessmentSettings
+        {
+            AiHintTimeoutSeconds = hintSeconds,
+            EssayEvaluationTimeoutSeconds = evaluationSeconds
+        };
+
+        Assert.True(settings.EssayClaimLifetime > settings.AiHintTimeout);
+        Assert.True(settings.EssayClaimLifetime > 2 * settings.EssayEvaluationTimeout);
+    }
+
+    [Fact]
+    public void AClaim_WithDefaultSettings_IsStaleAfterTwoMinutes()
+        => Assert.Equal(TimeSpan.FromMinutes(2), new AssessmentSettings().EssayClaimLifetime);
 }

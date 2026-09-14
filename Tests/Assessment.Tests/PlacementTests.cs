@@ -31,8 +31,17 @@ public class PlacementRuleTests
             (Question: 300 + i, Level: Level3.Id)
         }).ToDictionary(x => x.Question, x => x.Level);
 
+    // Every question worth 1 — the default Points.
+    private static Dictionary<int, byte> OnePointEach(Dictionary<int, int> levelOfQuestion) =>
+        levelOfQuestion.Keys.ToDictionary(id => id, _ => (byte)1);
+
     private static PlacementDecision Decide(Dictionary<int, int> levelOfQuestion, params int[] wrong) =>
-        PlacementEngine.Decide(Levels, levelOfQuestion, wrong.ToHashSet(), passPercentage: 75m);
+        PlacementEngine.Decide(
+            Levels, levelOfQuestion, OnePointEach(levelOfQuestion), wrong.ToHashSet(), passPercentage: 75m);
+
+    private static PlacementDecision DecideWeighted(
+        Dictionary<int, int> levelOfQuestion, Dictionary<int, byte> points, params int[] wrong) =>
+        PlacementEngine.Decide(Levels, levelOfQuestion, points, wrong.ToHashSet(), passPercentage: 75m);
 
     [Fact]
     public void MasteringEveryLevel_PlacesAtTheLastLevel()
@@ -78,7 +87,52 @@ public class PlacementRuleTests
     [Fact]
     public void Decide_RequiresAtLeastOneLevel()
         => Assert.Throws<ArgumentException>(() =>
-            PlacementEngine.Decide([], FourPerLevel(), new HashSet<int>(), 75m));
+            PlacementEngine.Decide([], FourPerLevel(), OnePointEach(FourPerLevel()), new HashSet<int>(), 75m));
+
+    [Fact]
+    public void MissingTheHeavyQuestion_FailsALevelThatCountingAloneWouldPass()
+    {
+        // L1: 101-103 worth 1, 104 worth 9. Wrong on 104 only: 3 of 4 questions
+        // (75%) but 3 of 12 points (25%) — not mastered.
+        var levels = FourPerLevel();
+        var points = OnePointEach(levels);
+        points[104] = 9;
+
+        var decision = DecideWeighted(levels, points, 104);
+        var level1 = decision.Levels.Single(l => l.Level == Level1);
+
+        Assert.False(level1.Mastered);
+        Assert.Equal(25m, level1.ScorePercentage);
+        Assert.Equal((3, 4, 3, 12), (level1.CorrectAnswers, level1.QuestionsAsked, level1.EarnedPoints, level1.TotalPoints));
+        Assert.Equal(Level1, decision.PlacedLevel);
+    }
+
+    [Fact]
+    public void GettingTheHeavyQuestionRight_MastersALevelThatCountingAloneWouldFail()
+    {
+        // Wrong on the three 1-point questions: 1 of 4 questions (25%) but 9 of 12
+        // points (75%) — mastered at the inclusive 75% threshold.
+        var levels = FourPerLevel();
+        var points = OnePointEach(levels);
+        points[104] = 9;
+
+        var decision = DecideWeighted(levels, points, 101, 102, 103);
+        var level1 = decision.Levels.Single(l => l.Level == Level1);
+
+        Assert.True(level1.Mastered);
+        Assert.Equal(75m, level1.ScorePercentage);
+        Assert.Equal(Level3, decision.PlacedLevel);
+    }
+
+    [Fact]
+    public void Decide_RefusesAQuestionWithoutPoints()
+    {
+        var levels = FourPerLevel();
+        var points = OnePointEach(levels);
+        points.Remove(203);
+
+        Assert.Throws<ArgumentException>(() => DecideWeighted(levels, points));
+    }
 
     [Fact]
     public void TheResult_ListsOnlyAssessedLevels_AndNamesThePlacedOne()
@@ -92,6 +146,8 @@ public class PlacementRuleTests
         Assert.Equal("Level 2", dto.LevelTitle);
         Assert.Equal(new[] { Level1.Id, Level3.Id }, dto.Levels.Select(l => l.LevelId).ToArray());
         Assert.Equal(75m, dto.Levels[0].ScorePercentage);
+        Assert.Equal(4, dto.Levels[0].TotalPoints);
+        Assert.Equal(3, dto.Levels[0].EarnedPoints);
     }
 }
 

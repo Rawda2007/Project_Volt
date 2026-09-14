@@ -15,6 +15,11 @@ public class QuestionConfiguration : IEntityTypeConfiguration<Question>
             tb.HasCheckConstraint("CK_Questions_Points", "[Points] > 0");
             tb.HasCheckConstraint("CK_Questions_QuestionType",
                 "[QuestionType] IN ('MultipleChoice', 'TrueFalse', 'Essay')");
+
+            // The AI reads text only: a question with an image must say in words
+            // what the image shows.
+            tb.HasCheckConstraint("CK_Questions_ImageHasDescription",
+                "[ImageUrl] IS NULL OR ([ImageDescription] IS NOT NULL AND LTRIM(RTRIM([ImageDescription])) <> N'')");
         });
 
         entity.HasIndex(e => e.Difficulty, "IX_Questions_Difficulty");
@@ -43,9 +48,11 @@ public class QuestionConfiguration : IEntityTypeConfiguration<Question>
             .HasConstraintName("FK_Questions_Quizzes");
 
         // DB: no ON DELETE clause (NO ACTION) — a Topic with Questions
-        // attached cannot be deleted.
+        // attached cannot be deleted. TopicId is NULL for a question that
+        // belongs to no topic (db/migrations/002).
         entity.HasOne(d => d.Topic).WithMany(p => p.Questions)
             .HasForeignKey(d => d.TopicId)
+            .IsRequired(false)
             .OnDelete(DeleteBehavior.Restrict)
             .HasConstraintName("FK_Questions_Topics");
     }
