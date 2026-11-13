@@ -31,30 +31,6 @@ The Flutter application is responsible for the client-side experience and intera
 
 ## Team Ownership
 
-### Eng. Basmala Adel Mohamed
-
-Responsible for:
-
-* Assessment Module
-* AI Integration
-* Gamification Module
-* Assessment business logic and workflows
-* AI-assisted hints
-* AI-assisted essay evaluation
-* Placement assessment
-* Level-Skip Challenge
-* Quiz attempts, retries, and grading flows
-* Learning statistics and mastery logic
-* Gamification and reward systems
-* Background processing
-* SignalR real-time updates
-* Response caching
-* Authorization and ownership enforcement for the implemented modules
-* Concurrency and idempotency protection
-* Flutter integration support
-* Flutter Integration Mocks
-
-
 ### Eng. Rawda Eweda
 
 Responsible for the **Users Module** and **Content Module**, including their business logic, data access, API integration, authorization, validation, database interaction, learning progress, media handling, Flutter integration support, and backend deployment.
@@ -127,6 +103,23 @@ https://volt.runasp.net/swagger/index.html
 https://volt-v2.runasp.net/swagger/index.html
 
 ---
+
+### Eng. Basmala Adel Mohamed
+
+Responsible for:
+
+* Assessment Module
+* AI Integration
+* Gamification Module
+* Assessment business logic and workflows
+* AI-assisted hints
+* AI-assisted essay evaluation
+* Placement assessment
+* Level-Skip Challenge
+* Quiz attempts, retries, and grading flows
+* Learning statistics and mastery logic
+
+
 
 ## Architecture
 
@@ -1051,46 +1044,6 @@ The repository is intentionally focused on backend implementation and backend/fr
 Internal development materials and private integration contracts are not included as public repository documentation.
 
 The repository focuses on the implemented backend modules, APIs, business rules, database integration, AI integration, background processing, testing, and Flutter integration support.
-
----
-
-# Contributors
-
-## Eng. Basmala Adel Mohamed
-
-* Assessment Module
-* AI Integration
-* Gamification Module
-* Assessment workflows and business rules
-* Quiz attempts and grading
-* Retry and hint systems
-* Placement assessment
-* Level-Skip Challenge
-* Learning statistics and mastery
-* Gamification and reward systems
-* Background processing
-* SignalR real-time updates
-* Response caching
-* Authorization and ownership enforcement for implemented modules
-* Concurrency and idempotency protection
-* Flutter Integration Mocks
-* Flutter/backend integration support
-* Assessment and Gamification testing
-
-## Eng. Rawda Eweda
-
-* Users Module
-* Content Module
-* Authentication and Authorization
-* Guest, Email, and Google Authentication
-* Password Reset and Email Verification
-* User Profile and Account Management
-* Learning Progress
-* Educational Content Management
-* Lesson Publishing and Ordering
-* Media and Image Handling
-* Flutter Integration Support
-* Backend Deployment and Server Management
 
 ---
 
